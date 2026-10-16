@@ -1,0 +1,785 @@
+/**
+ * =========================================================
+ * MEENA MARKETING - PRODUCTION PERPETUAL ENGINE (v3.0)
+ * =========================================================
+ * Features:
+ * - Puppeteer HTML-to-Image Generation for Festivals & Mugurtham
+ * - Bulletproof Memory Management (Guaranteed tab/browser closure)
+ * - Dynamic Tanglish/English Template Permutations via External JSON
+ * - Network-Resilient Weather & Calendar Fetches
+ * - Zero API Keys Needed
+ * - Advanced Error Retries & Pre-flight Disk Cleanup
+ * - Admin On-Demand WhatsApp Command Listener
+ * - Hardcore Process & Disconnect Crash Protection (NEW)
+ * - Scalable SVG Graphics Integration (NEW)
+ * - Firebase Single-Document State Management (NEW)
+ * - Bulletproof Missed Schedule Watchdog (NEW)
+ * - Enterprise JSON-based Muhurtham Scheduling Engine (NEW)
+ */
+
+const cron = require('node-cron');
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+const ical = require('node-ical');
+const puppeteer = require('puppeteer');
+// 🗑️ Removed '@ishubhamx/panchangam-js' dependency completely for stability
+// 🗑️ Removed 'whatsapp-web.js' dependency. Baileys handles media objects natively.
+
+// 🛡️ Added 'db' to the export signature to accept Firebase instance
+module.exports = (client, db) => {
+    console.log("📦 Starting other.js");
+
+    // ---------------------------------------------------------
+    // CRASH PROTECTION NET (Prevents silent exits)
+    // ---------------------------------------------------------
+    process.on('uncaughtException', (err) => {
+        console.error("🚨 CRITICAL ERROR (Uncaught Exception):", err.message);
+        console.error(err.stack);
+        // Keeps the Node process alive instead of crashing
+    });
+
+    process.on('unhandledRejection', (reason, promise) => {
+        console.error("🚨 CRITICAL ERROR (Unhandled Rejection):", reason);
+        // Keeps the Node process alive instead of crashing
+    });
+
+    // Adapted for Baileys connection state monitoring
+    if (client.ev) {
+        client.ev.on('connection.update', (update) => {
+            if (update.connection === 'close') {
+                console.error('🔴 WhatsApp Client Disconnected! Reason:', update.lastDisconnect?.error);
+                console.log('🔄 Server.js will automatically handle the safe client restart...');
+            }
+        });
+    }
+
+    // ---------------------------------------------------------
+    // DYNAMIC PHRASE LOADER (Hot-reloads from phrases.json)
+    // ---------------------------------------------------------
+    function getPhrases() {
+        try {
+            const data = fs.readFileSync(path.join(__dirname, 'phrases.json'), 'utf8');
+            return JSON.parse(data);
+        } catch (err) {
+            console.error("⚠️ Error reading phrases.json. Using emergency fallback.", err.message);
+            return {
+                morning: { intros: ["Morning team!"], bodies: ["Let's achieve today's targets."], outros: ["All the best!"] },
+                evening: { intros: ["Evening team!"], bodies: ["Update the pending logs."], outros: ["Close strong!"] },
+                wishes: { festivals: ["HAPPY"], mugurtham: ["BLESSED"] }
+            };
+        }
+    }
+
+    // ---------------------------------------------------------
+    // 0. PRE-FLIGHT DISK CLEANUP (Prevents storage leaks)
+    // ---------------------------------------------------------
+    try {
+        console.log("🧹 Running startup disk cleanup for old images...");
+        const files = fs.readdirSync(__dirname);
+        for (const file of files) {
+            if (file.startsWith('meena_marketing_') && file.endsWith('.png')) {
+                fs.unlinkSync(path.join(__dirname, file));
+                console.log(`🗑️ Cleared orphaned image: ${file}`);
+            }
+        }
+    } catch (err) {
+        console.error("⚠️ Cleanup error:", err.message);
+    }
+
+    // ---------------------------------------------------------
+    // 1. CONFIGURATION & STATE
+    // ---------------------------------------------------------
+    const SHOP_LAT = 8.61; // Alwarthirunagiri
+    const SHOP_LON = 77.94;
+    const ELEVATION = 15; // Kept to not break any existing lines/expectations
+    const CALENDAR_URL = 'https://calendar.google.com/calendar/ical/en.indian%23holiday%40group.v.calendar.google.com/public/basic.ics';
+    
+    // Admin Security: Only these numbers can trigger test commands
+    const ADMIN_NUMBERS = [
+        '919443042733@c.us', 
+        '919488669733@c.us'
+    ]; 
+
+    const RAM_FILE = path.join(__dirname, '.meena_group_ram.json');
+    let memoryGroupId = null;
+
+    function loadGroupMemory() {
+        if (fs.existsSync(RAM_FILE)) {
+            try {
+                const data = JSON.parse(fs.readFileSync(RAM_FILE, 'utf8'));
+                if (data.groupId) memoryGroupId = data.groupId;
+            } catch (e) {
+                console.error("⚠️ Failed to parse RAM file.");
+            }
+        }
+    }
+
+    function saveGroupMemory(id) {
+        memoryGroupId = id;
+        try {
+            fs.writeFileSync(RAM_FILE, JSON.stringify({ groupId: id }));
+        } catch (e) {
+            console.error("⚠️ Failed to save RAM file.");
+        }
+    }
+
+    loadGroupMemory();
+
+    // 🛡️ Firebase State Tracking (RAM Cached to prevent database reads)
+    let cachedMorningDate = null;
+    let cachedEveningDate = null;
+
+    async function loadFirebaseState() {
+        try {
+            const docSnap = await db.collection('group_message').doc('status').get();
+            if (docSnap.exists) {
+                const data = docSnap.data();
+                cachedMorningDate = data.lastMorningBlastDate || null;
+                cachedEveningDate = data.lastEveningBlastDate || null;
+                console.log(`🔥 [Firebase State Loaded] Morning: ${cachedMorningDate} | Evening: ${cachedEveningDate}`);
+            }
+        } catch (err) {
+            console.error("⚠️ Failed to load Firebase state on boot:", err.message);
+        }
+    }
+
+    loadFirebaseState(); // Fires exactly once on startup
+
+    // ---------------------------------------------------------
+    // 2. IMAGE GENERATION ENGINE (HTML to PNG via Puppeteer)
+    // ---------------------------------------------------------
+    async function generateCelebrationImage(title, subtitle, type) {
+        const tempPath = path.join(__dirname, `meena_marketing_${Date.now()}.png`);
+        let browser;
+        
+        try {
+            console.log(`🎨 Generating Image for: ${title}...`);
+            browser = await puppeteer.launch({
+                headless: true,
+                args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            });
+            
+            const page = await browser.newPage();
+            // 800x800 is the perfect square ratio for WhatsApp media
+            await page.setViewport({ width: 800, height: 800, deviceScaleFactor: 2 });
+
+            const mugurthamGradients = [
+                'linear-gradient(135deg, #800000 0%, #D4AF37 100%)', // Traditional Maroon & Gold
+                'linear-gradient(135deg, #4A0E4E 0%, #E8B923 100%)', // Deep Purple & Gold
+                'linear-gradient(135deg, #B22222 0%, #FFD700 100%)'  // Firebrick & Gold
+            ];
+            const festivalGradients = [
+                'linear-gradient(135deg, #0B0C10 0%, #1F2833 50%, #C5A138 100%)', // Elegant Dark & Gold
+                'linear-gradient(135deg, #004d00 0%, #b38f00 100%)', // Emerald & Gold
+                'linear-gradient(135deg, #003366 0%, #cc9900 100%)'  // Royal Blue & Gold
+            ];
+
+            const bgGradient = type === 'mugurtham'
+                ? mugurthamGradients[Math.floor(Math.random() * mugurthamGradients.length)]
+                : festivalGradients[Math.floor(Math.random() * festivalGradients.length)];
+
+            // 👑 NEW PROFESSIONAL SVG TEMPLATES
+            const mugurthamSVGs = [
+                // 1. Traditional Star
+                `<svg width="80" height="80" viewBox="0 0 24 24" fill="#FFD700"><path d="M12 1L9 9l-8 3 8 3 3 8 3-8 8-3-8-3-3-8z"/></svg>`,
+                // 2. Diamond / Jewel
+                `<svg width="80" height="80" viewBox="0 0 24 24" fill="#FFD700"><path d="M12 2L2 9l10 13L22 9l-10-7zM4.2 9l7.8-5.5v16.1L4.2 9zm15.6 0l-7.8-5.5v16.1l7.8-10.6z"/></svg>`,
+                // 3. Floral Mandala
+                `<svg width="80" height="80" viewBox="0 0 24 24" fill="#FFD700"><path d="M12 2c0 5.5-4.5 10-10 10 5.5 0 10 4.5 10 10 0-5.5 4.5-10 10-10-5.5 0-10-4.5-10-10z"/></svg>`,
+                // 4. Crown
+                `<svg width="80" height="80" viewBox="0 0 24 24" fill="#FFD700"><path d="M2 22h20v-2H2v2zm3-4h14L22 7l-6 4-4-6-4 6-6-4 5 11z"/></svg>`,
+                // 5. Interlocked Rings
+                `<svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="#FFD700" stroke-width="2"><circle cx="8" cy="12" r="6"/><circle cx="16" cy="12" r="6"/></svg>`
+            ];
+
+            const festivalSVGs = [
+                // 1. Classic Sparkles
+                `<svg width="80" height="80" viewBox="0 0 24 24" fill="#FFD700"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>`,
+                // 2. Gift Box
+                `<svg width="80" height="80" viewBox="0 0 24 24" fill="#FFD700"><path d="M20 8h-3.2c.7-1.1.9-2.4.2-3.6-1.1-1.8-3.4-2.2-5-1.1L12 3.8l-1.3-.9c-1.6-1.1-3.9-.7-5 1.1-.7 1.2-.5 2.5.2 3.6H4c-1.1 0-2 .9-2 2v4h20v-4c0-1.1-.9-2-2-2zM9 5c.8-.5 1.8-.3 2.3.5.5.8.3 1.8-.5 2.3-.3.2-.6.2-1 0-.8-.5-1-1.5-.8-2.8zm6 0c.2 1.3 0 2.3-.8 2.8-.4.2-.7.2-1 0-.8-.5-1-1.5-.5-2.3.5-.8 1.5-1 2.3-.5zM2 16h9v6H2v-6zm11 6v-6h9v6h-9z"/></svg>`,
+                // 3. Flame / Diya
+                `<svg width="80" height="80" viewBox="0 0 24 24" fill="#FFD700"><path d="M12 2c0 0-4 5.5-4 9.5a4 4 0 0 0 8 0C16 7.5 12 2 12 2zm0 13a2 2 0 1 1 0-4 2 2 0 0 1 0 4zm7 4H5c-1.1 0-2 .9-2 2v1h18v-1c0-1.1-.9-2-2-2z"/></svg>`,
+                // 4. Celebration Sun
+                `<svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="#FFD700" stroke-width="2" stroke-linecap="round"><path d="M12 4V2m0 20v-2m8-8h2M2 12h2m13.66-5.66l1.41-1.41M4.93 19.07l1.41-1.41m0-11.32L4.93 4.93m14.14 14.14l-1.41-1.41M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10z"/></svg>`,
+                // 5. Party Confetti Cone
+                `<svg width="80" height="80" viewBox="0 0 24 24" fill="#FFD700"><path d="M14 10l-4-4L3 13c-1.1 1.1-1.1 3 0 4.2.6.6 1.3.9 2.1.9s1.5-.3 2.1-.9l7-7zm6-6h-2v2h-2v2h2v2h2V8h2V6h-2V4z"/></svg>`
+            ];
+
+            const decorSVG = type === 'mugurtham' 
+                ? mugurthamSVGs[Math.floor(Math.random() * mugurthamSVGs.length)] 
+                : festivalSVGs[Math.floor(Math.random() * festivalSVGs.length)];
+            
+            // Fetch dynamically from phrases.json
+            const db_phrases = getPhrases();
+            const festivalWishes = db_phrases.wishes.festivals;
+            const mugurthamWishes = db_phrases.wishes.mugurtham;
+
+            let dynamicWish = "";
+            if (type === 'festival') dynamicWish = festivalWishes[Math.floor(Math.random() * festivalWishes.length)];
+            else if (type === 'mugurtham') dynamicWish = mugurthamWishes[Math.floor(Math.random() * mugurthamWishes.length)];
+            
+            const universalWish = (type === 'festival' || type === 'mugurtham') ? `<div class="wish-text">${dynamicWish}</div>` : '';
+
+            const htmlContent = `
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700&family=Montserrat:wght@500;700&display=swap" rel="stylesheet">
+                    <style>
+                        body {
+                            margin: 0;
+                            padding: 0;
+                            width: 800px;
+                            height: 800px;
+                            background: ${bgGradient};
+                            display: flex;
+                            flex-direction: column;
+                            justify-content: center;
+                            align-items: center;
+                            text-align: center;
+                            color: white;
+                            font-family: 'Montserrat', sans-serif;
+                            box-sizing: border-box;
+                            border: 15px solid rgba(255, 215, 0, 0.4); 
+                            overflow: hidden; 
+                        }
+                        .from-text {
+                            font-size: 18px;
+                            font-weight: 500;
+                            letter-spacing: 3px;
+                            margin-bottom: 5px;
+                            color: rgba(255, 255, 255, 0.9);
+                        }
+                        .brand {
+                            font-size: 36px;
+                            font-weight: 700;
+                            letter-spacing: 5px;
+                            text-transform: uppercase;
+                            margin-bottom: 25px;
+                            color: #FFD700;
+                            text-shadow: 2px 2px 8px rgba(0,0,0,0.6);
+                            max-width: 90%;
+                            word-wrap: break-word;
+                        }
+                        .decor {
+                            margin-bottom: 25px;
+                            filter: drop-shadow(2px 4px 6px rgba(0,0,0,0.5));
+                        }
+                        .wish-text {
+                            font-size: 22px;
+                            font-weight: 500;
+                            letter-spacing: 3px;
+                            margin-bottom: 10px;
+                            color: rgba(255, 255, 255, 0.9);
+                            text-transform: uppercase;
+                        }
+                        .title {
+                            font-family: 'Playfair Display', serif;
+                            font-size: clamp(40px, 8vw, 65px); 
+                            font-weight: 700;
+                            margin: 0 20px 20px 20px;
+                            line-height: 1.2;
+                            text-shadow: 3px 3px 10px rgba(0,0,0,0.5);
+                            max-width: 90%;
+                            word-wrap: break-word;
+                            overflow-wrap: break-word;
+                        }
+                        .subtitle {
+                            font-size: clamp(18px, 4vw, 24px); 
+                            font-weight: 500;
+                            background: rgba(0, 0, 0, 0.4);
+                            padding: 15px 30px;
+                            border-radius: 50px;
+                            margin-top: 20px;
+                            border: 1px solid rgba(255, 215, 0, 0.3);
+                            max-width: 85%;
+                            word-wrap: break-word;
+                        }
+                    </style>
+                </head>
+                <body>
+                    <div class="from-text">WISHING YOU FROM</div>
+                    <div class="brand">MEENA MARKETING</div>
+                    <div class="decor">${decorSVG}</div>
+                    ${universalWish}
+                    <div class="title">${title}</div>
+                    <div class="subtitle">${subtitle}</div>
+                </body>
+                </html>
+            `;
+
+            await page.setContent(htmlContent, { waitUntil: 'networkidle0' });
+            
+            // Wait for Web Fonts to fully load before snapping the picture
+            await page.evaluateHandle('document.fonts.ready');
+            
+            await page.screenshot({ path: tempPath, type: 'png' });
+            
+            console.log("✅ Image successfully rendered.");
+            return tempPath;
+        } catch (error) {
+            console.error('⚠️ Image Generation Failed:', error.message);
+            return null;
+        } finally {
+            if (browser) {
+                await browser.close();
+                console.log("🧹 Puppeteer memory cleared.");
+            }
+        }
+    }
+
+    // ---------------------------------------------------------
+    // 3. ENTERPRISE MUHURTHAM JSON CHECKER
+    // ---------------------------------------------------------
+    function checkMuhurtham(targetDateString) {
+        try {
+            // FIXED: Pointing to the exact file name provided (mugurtham.json)
+            const filePath = path.join(__dirname, 'mugurtham.json');
+            if (!fs.existsSync(filePath)) {
+                console.warn("⚠️ mugurtham.json not found! Defaulting to non-muhurtham.");
+                return false;
+            }
+            
+            const rawData = fs.readFileSync(filePath, 'utf8');
+            const muhurthamDates = JSON.parse(rawData);
+            
+            // Fast O(1) array inclusion check for exact YYYY-MM-DD format
+            return Array.isArray(muhurthamDates) && muhurthamDates.includes(targetDateString);
+        } catch (error) {
+            console.error("⚠️ Error parsing mugurtham.json:", error.message); 
+            return false;
+        }
+    }
+
+    // ---------------------------------------------------------
+    // 4. FESTIVAL ENGINE (Google .ics)
+    // ---------------------------------------------------------
+    async function checkFestivalToday() {
+        let response;
+        for (let i = 0; i < 3; i++) {
+            try {
+                response = await axios.get(CALENDAR_URL, { timeout: 10000 });
+                break; // Success, exit retry loop
+            } catch (error) {
+                if (i === 2) return null; // Failed all retries
+                await new Promise(res => setTimeout(res, 2000)); // Wait 2s before retry
+            }
+        }
+        
+        try {
+            const events = ical.sync.parseICS(response.data);
+            
+            // Format to IST local timezone to prevent fetching wrong days
+            const todayString = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
+            for (const event of Object.values(events)) {
+                if (event.type === 'VEVENT' && event.start) {
+                    const eventDateString = new Date(event.start).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+                    if (eventDateString === todayString) {
+                        return event.summary;
+                    }
+                }
+            }
+            return null;
+        } catch (error) {
+            return null;
+        }
+    }
+
+    // ---------------------------------------------------------
+    // 5. WEATHER ENGINE (Open-Meteo)
+    // ---------------------------------------------------------
+    async function getWeatherData() {
+        const url = `https://api.open-meteo.com/v1/forecast?latitude=${SHOP_LAT}&longitude=${SHOP_LON}&current=temperature_2m,weather_code&timezone=auto`;
+        let response;
+        for (let i = 0; i < 3; i++) {
+            try {
+                response = await axios.get(url, { timeout: 8000 });
+                break;
+            } catch (error) {
+                if (i === 2) return "Unable to fetch today's weather data due to network issues.";
+                await new Promise(res => setTimeout(res, 2000));
+            }
+        }
+        
+        try {
+            const currentTemp = response.data.current.temperature_2m;
+            const wmoCode = String(response.data.current.weather_code);
+            
+            const weatherDesc = {
+                "0": "Clear sky ☀️", "1": "Mainly clear 🌤️", "2": "Partly cloudy ⛅", "3": "Overcast ☁️",
+                "45": "Foggy 🌫️", "51": "Light drizzle 🌧️", "61": "Slight rain 🌧️", "65": "Heavy rain 🌧️",
+                "80": "Rain showers 🌦️", "95": "Thunderstorm 🌩️"
+            };
+
+            const condition = weatherDesc[wmoCode] || "Clear";
+            return `It is currently ${currentTemp}°C and ${condition} in Alwarthirunagiri.`;
+        } catch (error) {
+            return "Unable to fetch today's weather data due to network issues.";
+        }
+    }
+
+    // ---------------------------------------------------------
+    // 6. PERMUTATION ENGINE (Tanglish/English via JSON)
+    // ---------------------------------------------------------
+    function generateMorningQuote() {
+        const db_phrases = getPhrases();
+        const intros = db_phrases.morning.intros;
+        const bodies = db_phrases.morning.bodies;
+        const outros = db_phrases.morning.outros;
+
+        const intro = intros[Math.floor(Math.random() * intros.length)];
+        const body = bodies[Math.floor(Math.random() * bodies.length)];
+        const outro = outros[Math.floor(Math.random() * outros.length)];
+
+        return `${intro} ${body} ${outro}`;
+    }
+
+    function generateEveningQuote() {
+        const db_phrases = getPhrases();
+        const intros = db_phrases.evening.intros;
+        const bodies = db_phrases.evening.bodies;
+        const outros = db_phrases.evening.outros;
+
+        const intro = intros[Math.floor(Math.random() * intros.length)];
+        const body = bodies[Math.floor(Math.random() * bodies.length)];
+        const outro = outros[Math.floor(Math.random() * outros.length)];
+
+        return `${intro} ${body} ${outro}`;
+    }
+
+    // ---------------------------------------------------------
+    // 7. MESSAGE DISPATCHERS
+    // ---------------------------------------------------------
+    async function ensureGroupConnection() {
+        // 1. Check local RAM/disk cache first
+        if (memoryGroupId) {
+            return true;
+        }
+
+        // 2. Fetch via Hugging Face Secrets / Environment Variable
+        const rawInvite = process.env.GROUP_INVITE_CODE || process.env.GROUP_INVITE_LINK;
+        if (rawInvite) {
+            try {
+                // Sanitize input: extract code from full link if present
+                let inviteCode = rawInvite.trim();
+                if (inviteCode.includes('chat.whatsapp.com/')) {
+                    inviteCode = inviteCode.split('chat.whatsapp.com/')[1].split('?')[0].split('/')[0].trim();
+                }
+
+                console.log(`🔍 Fetching Group ID via Hugging Face Secret invite code (${inviteCode})...`);
+                const inviteInfo = await client.groupGetInviteInfo(inviteCode);
+
+                if (inviteInfo && inviteInfo.id) {
+                    const fetchedGroupId = inviteInfo.id + '@g.us'; // Baileys uses @g.us for groups natively
+                    console.log(`✅ Group ID successfully resolved & saved: ${fetchedGroupId}`);
+                    saveGroupMemory(fetchedGroupId);
+                    return true;
+                } else {
+                    console.log("⚠️ Group info retrieved via link, but missing ID property.");
+                }
+            } catch (err) {
+                console.error(`⚠️ Failed to resolve Group ID from Secret invite code: ${err.message}`);
+            }
+        } else {
+            console.log("ℹ️ No GROUP_INVITE_CODE found in Secrets. Defaulting to DOM chat scanning...");
+        }
+
+        // 3. Fallback: Scan recent participating groups
+        try {
+            console.log("🔍 Scanning chat list for target group...");
+            const groups = await client.groupFetchAllParticipating();
+            const groupChats = Object.values(groups);
+            
+            if (groupChats.length > 0) {
+                const foundId = groupChats[0].id;
+                console.log(`✅ Found group via chat scan: ${foundId}`);
+                saveGroupMemory(foundId);
+                return true;
+            } else {
+                console.log("⚠️ No group chat found in recent chat list.");
+                return false;
+            }
+        } catch (err) {
+            console.error(`⚠️ DOM chat scan failed: ${err.message}`);
+            return false;
+        }
+    }
+
+    // FIXED: Added force parameter to bypass memory locks for manual tests
+    async function sendMorningBlast(force = false) {
+        const todayString = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); // Output: YYYY-MM-DD
+        
+        // 🛡️ Guard: Prevent duplicate sends on the same day (Bypass if forced)
+        if (!force && cachedMorningDate === todayString) {
+            console.log(`⏸️ Morning Blast already sent for today (${todayString}). Skipping.`);
+            return;
+        }
+
+        // 🔒 OPTIMISTIC LOCK: Claim task immediately to block the Watchdog from double-firing
+        if (!force) cachedMorningDate = todayString;
+
+        console.log("☀️ Executing Morning Blast...");
+        if (!(await ensureGroupConnection())) {
+            if (!force) cachedMorningDate = null; // Unlock if connection completely fails
+            return;
+        }
+
+        const weatherText = await getWeatherData();
+        const festival = await checkFestivalToday();
+        
+        // 👈 THE NEW JSON CHECK FIX FOR TODAY
+        const isTodayMuhurtham = checkMuhurtham(todayString);
+        // ------------------------------------------
+
+        const quote = generateMorningQuote();
+        
+        let imagePath = null;
+        const dateStr = new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' });
+
+        let finalMessage = `🌅 *Meena Marketing Update*\n\n`;
+        finalMessage += `🌤️ *Today's Weather:* ${weatherText}\n\n`;
+        
+        if (festival) {
+            imagePath = await generateCelebrationImage(festival, dateStr, 'festival');
+            finalMessage += `🎉 *Festival Alert:* Happy ${festival} to the Meena Marketing family! Let's make today special! 🎊\n\n`;
+        } else if (isTodayMuhurtham) {
+            imagePath = await generateCelebrationImage('SUBA MUGURTHAM', dateStr, 'mugurtham');
+            // FIXED: Removed "mathematically highly auspicious" string for a natural tone
+            finalMessage += `💍 *Auspicious Day:* Today is an auspicious day! Expect high footfall and be ready to close sales! 🚀\n\n`;
+        }
+        
+        finalMessage += `💬 ${quote}\n\n`;
+        finalMessage += `━━━━━━━━━━━━━━━━━━\n_🤖 System Generated Message_`;
+
+        try {
+            if (imagePath && fs.existsSync(imagePath)) {
+                await client.sendMessage(memoryGroupId, { image: { url: imagePath }, caption: finalMessage });
+                try { fs.unlinkSync(imagePath); } catch (e) {}
+            } else {
+                await client.sendMessage(memoryGroupId, { text: finalMessage });
+            }
+
+            // 🛡️ Blind Write to Firebase (1 Write, 0 Reads) - Bypass writing if it's a test
+            if (!force) {
+                await db.collection('group_message').doc('status').set({
+                    lastMorningBlastDate: todayString
+                }, { merge: true });
+            }
+
+            console.log(`✅ Morning Blast completed and logged for ${todayString}`);
+        } catch (e) {
+            console.error("⚠️ Message send failed:", e.message);
+            if (!force) cachedMorningDate = null; // Unlock so it can retry later
+        }
+    }
+
+    // FIXED: Added force parameter to bypass memory locks for manual tests
+    async function sendEveningBlast(force = false) {
+        const todayString = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); // Output: YYYY-MM-DD
+        
+        // 🛡️ Guard: Prevent duplicate sends on the same day (Bypass if forced)
+        if (!force && cachedEveningDate === todayString) {
+            console.log(`⏸️ Evening Blast already sent for today (${todayString}). Skipping.`);
+            return;
+        }
+
+        // 🔒 OPTIMISTIC LOCK: Claim task immediately to block the Watchdog from double-firing
+        if (!force) cachedEveningDate = todayString;
+
+        console.log("🌙 Executing Evening Blast...");
+        if (!(await ensureGroupConnection())) {
+            if (!force) cachedEveningDate = null; // Unlock if connection completely fails
+            return;
+        }
+
+        // 👈 THE NEW JSON CHECK FIX FOR TOMORROW
+        const todayStrTime = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
+        const tomorrow = new Date(todayStrTime);
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        
+        const tomorrowString = tomorrow.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        const isTomorrowMuhurtham = checkMuhurtham(tomorrowString);
+        // ------------------------------------------
+        
+        let finalMessage = `🌅 *Meena Marketing - Evening Update*\n\n`;
+        let imagePath = null;
+        
+        // Formatting tomorrow's date for the visual image
+        const tomorrowDateStr = tomorrow.toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' });
+
+        if (isTomorrowMuhurtham) {
+            imagePath = await generateCelebrationImage('TOMORROW IS MUGURTHAM', tomorrowDateStr, 'mugurtham');
+            finalMessage += `💍 *நாளை சுபமுகூர்த்த தினம்!*\nகடையில் நல்ல கூட்டம் வர வாய்ப்புள்ளது. நாளைக்கு தேவையான ஸ்டாக் மற்றும் டிஸ்பிளேவை இப்போதே சரியாக தயார் செய்து வையுங்கள். Let's get ready for a great sales day tomorrow! 🚀\n\n`;
+        } else {
+            const quote = generateEveningQuote();
+            finalMessage += `💬 ${quote}\n\n`;
+        }
+
+        finalMessage += `━━━━━━━━━━━━━━━━━━\n_🤖 System Generated Message_`;
+
+        try {
+            if (imagePath && fs.existsSync(imagePath)) {
+                await client.sendMessage(memoryGroupId, { image: { url: imagePath }, caption: finalMessage });
+                try { fs.unlinkSync(imagePath); } catch (e) {}
+            } else {
+                await client.sendMessage(memoryGroupId, { text: finalMessage });
+            }
+
+            // 🛡️ Blind Write to Firebase (1 Write, 0 Reads) - Bypass writing if it's a test
+            if (!force) {
+                await db.collection('group_message').doc('status').set({
+                    lastEveningBlastDate: todayString
+                }, { merge: true });
+            }
+
+            console.log(`✅ Evening Blast completed and logged for ${todayString}`);
+        } catch (e) {
+            console.error("⚠️ Message send failed:", e.message);
+            if (!force) cachedEveningDate = null; // Unlock so it can retry later
+        }
+    }
+
+    async function sendForcedFestivalBlast(festivalName) {
+        console.log(`🛠️ Executing Forced Festival Blast for: ${festivalName}...`);
+        if (!(await ensureGroupConnection())) return;
+
+        const weatherText = await getWeatherData();
+        const quote = generateMorningQuote();
+        
+        let imagePath = null;
+        const dateStr = new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' });
+
+        let finalMessage = `🌅 *Meena Marketing Update (TEST)*\n\n`;
+        finalMessage += `🌤️ *Today's Weather:* ${weatherText}\n\n`;
+        
+        imagePath = await generateCelebrationImage(festivalName, dateStr, 'festival');
+        finalMessage += `🎉 *Festival Alert:* Happy ${festivalName} to the Meena Marketing family! Let's make today special! 🎊\n\n`;
+        
+        finalMessage += `💬 ${quote}\n\n`;
+        finalMessage += `━━━━━━━━━━━━━━━━━━\n_🤖 System Generated Message_`;
+
+        try {
+            if (imagePath && fs.existsSync(imagePath)) {
+                await client.sendMessage(memoryGroupId, { image: { url: imagePath }, caption: finalMessage });
+                try { fs.unlinkSync(imagePath); } catch (e) {}
+            } else {
+                await client.sendMessage(memoryGroupId, { text: finalMessage });
+            }
+        } catch (e) {
+            console.error("⚠️ Message send failed:", e.message);
+        }
+    }
+
+    // ---------------------------------------------------------
+    // 8. ON-DEMAND TESTING COMMANDS (Admin Only)
+    // ---------------------------------------------------------
+    client.ev.on('messages.upsert', async ({ messages, type }) => {
+        if (type !== 'notify') return;
+        const msg = messages[0];
+        
+        if (!msg.message || msg.key.fromMe) return;
+        
+        const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
+        if (!textMessage.toLowerCase().startsWith('!test')) return;
+
+        // Fix: In Baileys, participant handles group senders, remoteJid handles individual senders.
+        const sender = msg.key.participant || msg.key.remoteJid;
+        
+        // Security Check: Now allowing anyone as requested (previously restricted to admins)
+        const baileysAdmins = ADMIN_NUMBERS.map(n => n.replace('@c.us', '@s.whatsapp.net'));
+        if (!baileysAdmins.includes(sender)) {
+            console.log(`ℹ️ Test command attempt from non-admin/anyone: ${sender}. Allowing access.`);
+            // return; // Commented out to allow anyone to use the command
+        }
+
+        const args = textMessage.trim().split(' ');
+        const command = args[1] ? args[1].toLowerCase() : '';
+
+        // Helper functions for Baileys UI actions
+        const react = async (emoji) => await client.sendMessage(msg.key.remoteJid, { react: { text: emoji, key: msg.key } });
+        const reply = async (text) => await client.sendMessage(msg.key.remoteJid, { text }, { quoted: msg });
+
+        try {
+            // Acknowledge receipt immediately with an hourglass reaction
+            await react('⏳'); 
+
+            if (command === 'morning') {
+                console.log(`🛠️ User ${sender} triggered manual morning test.`);
+                await sendMorningBlast(true); // FIXED: Pass true to bypass locks & Firebase
+                await react('✅');
+            } 
+            else if (command === 'evening') {
+                console.log(`🛠️ User ${sender} triggered manual evening test.`);
+                await sendEveningBlast(true); // FIXED: Pass true to bypass locks & Firebase
+                await react('✅');
+            } 
+            else if (command === 'festival') {
+                const festivalName = args.slice(2).join(' '); // Capture everything after "!test festival"
+                
+                if (!festivalName) {
+                    await reply('⚠️ Please provide a festival name. \nExample: *!test festival Diwali*');
+                    await react('❌');
+                    return;
+                }
+                
+                console.log(`🛠️ User ${sender} triggered manual festival test for: ${festivalName}`);
+                await sendForcedFestivalBlast(festivalName);
+                await react('✅');
+            } 
+            else {
+                await reply('ℹ️ *Available Test Commands:*\n\n1️⃣ `!test morning`\n2️⃣ `!test evening`\n3️⃣ `!test festival [Name]`');
+                await react('❓');
+            }
+        } catch (err) {
+            console.error(`⚠️ Test command failed: ${err.message}`);
+            await react('❌');
+        }
+    });
+
+    // ---------------------------------------------------------
+    // 9. EXACT CRON SCHEDULERS
+    // ---------------------------------------------------------
+    // 🛡️ Strict execution with explicit timezone overrides
+    cron.schedule('0 7 * * *', () => {
+        console.log(`⏰ [Scheduler] Running Morning Blast at 7:00 AM IST...`);
+        sendMorningBlast();
+    }, {
+        scheduled: true,
+        timezone: "Asia/Kolkata"
+    });
+
+    cron.schedule('0 17 * * *', () => {
+        console.log(`⏰ [Scheduler] Running Evening Blast at 5:00 PM IST...`);
+        sendEveningBlast();
+    }, {
+        scheduled: true,
+        timezone: "Asia/Kolkata"
+    });
+
+    // ---------------------------------------------------------
+    // 10. BULLETPROOF WATCHDOG (Catches missed schedules safely)
+    // ---------------------------------------------------------
+    setInterval(async () => {
+        // 1. Get strict IST Date String securely
+        const todayString = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        
+        // 2. Get current hour in IST (returns a number from 0 to 23)
+        const hourString = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata', hour: 'numeric', hour12: false });
+        const currentHour = parseInt(hourString, 10);
+
+        // Morning Catch-up: Past 7 AM, but strictly BEFORE 12 PM (Noon).
+        // If the PC wakes up past noon, the morning blast is permanently skipped for today.
+        if (currentHour >= 7 && currentHour < 12 && cachedMorningDate !== todayString) {
+            console.log("🛡️ Watchdog caught a missed Morning Blast. Executing recovery...");
+            await sendMorningBlast();
+        }
+
+        // Evening Catch-up: Past 5 PM (17), but strictly BEFORE 11 PM (23).
+        if (currentHour >= 17 && currentHour < 23 && cachedEveningDate !== todayString) {
+            console.log("🛡️ Watchdog caught a missed Evening Blast. Executing recovery...");
+            await sendEveningBlast();
+        }
+    }, 10 * 60 * 1000); // Checks every 10 minutes
+};
