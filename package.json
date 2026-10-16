@@ -1,14 +1,26 @@
 {
-  "name": "whatsapp-bot",
+  "name": "meena-marketing-billing-bot",
   "version": "1.0.0",
-  "description": "WhatsApp Baileys Bot for Render",
+  "description": "Standalone WhatsApp Billing Bot and QR Dashboard for Meena Marketing.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.9",
-    "qrcode-terminal": "^0.12.0",
-    "pino": "^9.0.0"
-  }
+    "axios": "*",
+    "dotenv": "^16.4.5",
+    "express": "^5.2.1",
+    "firebase-admin": "^13.8.0",
+    "node-cron": "*",
+    "node-ical": "*",
+    "pino": "^9.0.0",
+    "puppeteer": "^24.42.0",
+    "qrcode": "^1.5.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "Siva Manihandan - Goorac Corporation",
+  "license": "ISC"
 }
