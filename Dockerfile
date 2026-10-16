@@ -1,27 +1,26 @@
 # Use the official Puppeteer image which includes Node.js and Google Chrome
 FROM ghcr.io/puppeteer/puppeteer:latest
 
-# Switch to root to copy files, install dependencies, and set permissions
+# Switch to root to copy files and set folder permissions
 USER root
-
-# Set the working directory inside the container
 WORKDIR /app
 
-# Copy package files and install NPM dependencies
-COPY package*.json ./
-RUN npm install
-
-# Copy your server.js and all other project files (marketing.js, JSONs, etc.)
+# Copy your project files into the container
 COPY . .
 
-# CRITICAL FIX: Grant the container permissions to write the Baileys session folder 
-# and QR code files to the disk without throwing an EACCES (permission denied) error
+# Grant the pptruser ownership of the /app directory so it can install modules and save sessions
 RUN chown -R pptruser:pptruser /app
 
-# Switch back to the safe, non-root user provided by the Puppeteer image
+# Switch to the safe, non-root user
 USER pptruser
 
-# Expose port 7860 for your Express QR dashboard
+# Install NPM dependencies AS pptruser so Chrome goes to /home/pptruser/.cache/puppeteer
+RUN npm install
+
+# Explicitly force Puppeteer to install the exact expected Chrome binary
+RUN npx puppeteer browsers install chrome
+
+# Expose the port for your web dashboard
 EXPOSE 7860
 
 # Start the bot
