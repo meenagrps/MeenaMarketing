@@ -323,7 +323,11 @@ module.exports = (client, db) => {
             return null;
         } finally {
             if (browser) {
-                await browser.close();
+                try {
+                    await browser.close();
+                } catch (closeErr) {
+                    console.error('⚠️ Error closing browser:', closeErr.message);
+                }
                 console.log("🧹 Puppeteer memory cleared.");
             }
         }
@@ -472,7 +476,8 @@ module.exports = (client, db) => {
                 const inviteInfo = await client.groupGetInviteInfo(inviteCode);
 
                 if (inviteInfo && inviteInfo.id) {
-                    const fetchedGroupId = inviteInfo.id + '@g.us'; // Baileys uses @g.us for groups natively
+                    const rawId = String(inviteInfo.id);
+                    const fetchedGroupId = rawId.endsWith('@g.us') ? rawId : `${rawId}@g.us`; // Baileys uses @g.us for groups natively
                     console.log(`✅ Group ID successfully resolved & saved: ${fetchedGroupId}`);
                     saveGroupMemory(fetchedGroupId);
                     return true;
@@ -697,9 +702,24 @@ module.exports = (client, db) => {
         const args = textMessage.trim().split(' ');
         const command = args[1] ? args[1].toLowerCase() : '';
 
-        // Helper functions for Baileys UI actions
-        const react = async (emoji) => await client.sendMessage(msg.key.remoteJid, { react: { text: emoji, key: msg.key } });
-        const reply = async (text) => await client.sendMessage(msg.key.remoteJid, { text }, { quoted: msg });
+        // Helper functions for Baileys UI actions (Safely wrapped to prevent unhandled rejections on socket disconnect)
+        const react = async (emoji) => {
+            try {
+                if (!client) return;
+                await client.sendMessage(msg.key.remoteJid, { react: { text: emoji, key: msg.key } });
+            } catch (e) {
+                console.warn(`⚠️ Suppressed reaction error: ${e.message}`);
+            }
+        };
+
+        const reply = async (text) => {
+            try {
+                if (!client) return;
+                await client.sendMessage(msg.key.remoteJid, { text }, { quoted: msg });
+            } catch (e) {
+                console.warn(`⚠️ Suppressed reply error: ${e.message}`);
+            }
+        };
 
         try {
             // Acknowledge receipt immediately with an hourglass reaction
