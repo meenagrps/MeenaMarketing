@@ -24,32 +24,43 @@ const path = require('path');
 const ical = require('node-ical');
 const puppeteer = require('puppeteer');
 // 🗑️ Removed '@ishubhamx/panchangam-js' dependency completely for stability
-// 🗑️ Removed 'whatsapp-web.js' dependency. Baileys handles media objects natively.
+// Retained comment for line preservation: Replaced { MessageMedia } = require('whatsapp-web.js') with native Baileys Buffer handling
+
+let isOtherModuleInitialized = false;
+let activeClient = null; // Holds the latest Baileys socket reference across reconnects
 
 // 🛡️ Added 'db' to the export signature to accept Firebase instance
 module.exports = (client, db) => {
     console.log("📦 Starting other.js");
+    activeClient = client;
 
     // ---------------------------------------------------------
     // CRASH PROTECTION NET (Prevents silent exits)
     // ---------------------------------------------------------
-    process.on('uncaughtException', (err) => {
-        console.error("🚨 CRITICAL ERROR (Uncaught Exception):", err.message);
-        console.error(err.stack);
-        // Keeps the Node process alive instead of crashing
-    });
+    if (!global.otherCrashHandlersRegistered) {
+        global.otherCrashHandlersRegistered = true;
 
-    process.on('unhandledRejection', (reason, promise) => {
-        console.error("🚨 CRITICAL ERROR (Unhandled Rejection):", reason);
-        // Keeps the Node process alive instead of crashing
-    });
+        process.on('uncaughtException', (err) => {
+            console.error("🚨 CRITICAL ERROR (Uncaught Exception):", err.message);
+            console.error(err.stack);
+            // Keeps the Node process alive instead of crashing
+        });
 
-    // Adapted for Baileys connection state monitoring
-    if (client.ev) {
+        process.on('unhandledRejection', (reason, promise) => {
+            console.error("🚨 CRITICAL ERROR (Unhandled Rejection):", reason);
+            // Keeps the Node process alive instead of crashing
+        });
+    }
+
+    // Baileys connection monitor (replaces whatsapp-web.js client.on('disconnected'))
+    if (client && client.ev && !client._meenaOtherDisconnectListenerAttached) {
+        client._meenaOtherDisconnectListenerAttached = true;
         client.ev.on('connection.update', (update) => {
-            if (update.connection === 'close') {
-                console.error('🔴 WhatsApp Client Disconnected! Reason:', update.lastDisconnect?.error);
-                console.log('🔄 Server.js will automatically handle the safe client restart...');
+            const { connection, lastDisconnect } = update;
+            if (connection === 'close') {
+                const reason = lastDisconnect?.error?.message || 'Connection closed';
+                console.error('🔴 [other.js] WhatsApp Socket Closed! Reason:', reason);
+                console.log('🔄 [other.js] Server.js will handle automatic socket reconnection...');
             }
         });
     }
@@ -95,10 +106,12 @@ module.exports = (client, db) => {
     const ELEVATION = 15; // Kept to not break any existing lines/expectations
     const CALENDAR_URL = 'https://calendar.google.com/calendar/ical/en.indian%23holiday%40group.v.calendar.google.com/public/basic.ics';
     
-    // Admin Security: Only these numbers can trigger test commands
+    // Admin Security: Only these numbers can trigger test commands (Supports both @c.us and Baileys @s.whatsapp.net)
     const ADMIN_NUMBERS = [
         '919443042733@c.us', 
-        '919488669733@c.us'
+        '919488669733@c.us',
+        '919443042733@s.whatsapp.net',
+        '919488669733@s.whatsapp.net'
     ]; 
 
     const RAM_FILE = path.join(__dirname, '.meena_group_ram.json');
@@ -147,20 +160,30 @@ module.exports = (client, db) => {
     loadFirebaseState(); // Fires exactly once on startup
 
     // ---------------------------------------------------------
-    // 2. IMAGE GENERATION ENGINE (HTML to PNG via Puppeteer)
+    // 2. IMAGE GENERATION ENGINE (HTML to PNG via Puppeteer - 512MB RAM SAFE)
     // ---------------------------------------------------------
     async function generateCelebrationImage(title, subtitle, type) {
         const tempPath = path.join(__dirname, `meena_marketing_${Date.now()}.png`);
-        let browser;
+        let browser = null;
+        let page = null;
         
         try {
             console.log(`🎨 Generating Image for: ${title}...`);
             browser = await puppeteer.launch({
                 headless: true,
-                args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+                args: [
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-accelerated-2d-canvas',
+                    '--no-first-run',
+                    '--no-zygote',
+                    '--single-process',
+                    '--disable-gpu'
+                ]
             });
             
-            const page = await browser.newPage();
+            page = await browser.newPage();
             // 800x800 is the perfect square ratio for WhatsApp media
             await page.setViewport({ width: 800, height: 800, deviceScaleFactor: 2 });
 
@@ -309,7 +332,7 @@ module.exports = (client, db) => {
                 </html>
             `;
 
-            await page.setContent(htmlContent, { waitUntil: 'networkidle0' });
+            await page.setContent(htmlContent, { waitUntil: 'networkidle0', timeout: 60000 });
             
             // Wait for Web Fonts to fully load before snapping the picture
             await page.evaluateHandle('document.fonts.ready');
@@ -322,13 +345,20 @@ module.exports = (client, db) => {
             console.error('⚠️ Image Generation Failed:', error.message);
             return null;
         } finally {
+            // Immediately close page and completely terminate Chrome so 0 MB remains in RAM
+            if (page) {
+                await page.close().catch(() => {});
+            }
             if (browser) {
-                try {
-                    await browser.close();
-                } catch (closeErr) {
-                    console.error('⚠️ Error closing browser:', closeErr.message);
+                const browserProcess = browser.process();
+                await browser.close().catch(() => {});
+                if (browserProcess && !browserProcess.killed) {
+                    try { browserProcess.kill('SIGKILL'); } catch (e) {}
                 }
                 console.log("🧹 Puppeteer memory cleared.");
+            }
+            if (global && global.gc) {
+                try { global.gc(); } catch (e) {}
             }
         }
     }
@@ -454,9 +484,29 @@ module.exports = (client, db) => {
     }
 
     // ---------------------------------------------------------
-    // 7. MESSAGE DISPATCHERS
+    // 7. MESSAGE DISPATCHERS (BAILEYS EDITION)
     // ---------------------------------------------------------
+    async function sendGroupMessageWithMedia(groupJid, textContent, imagePath) {
+        const sock = activeClient;
+        if (!sock) throw new Error("WhatsApp socket is not initialized.");
+
+        if (imagePath && fs.existsSync(imagePath)) {
+            const imageBuffer = fs.readFileSync(imagePath);
+            await sock.sendMessage(groupJid, {
+                image: imageBuffer,
+                caption: textContent
+            });
+        } else {
+            await sock.sendMessage(groupJid, {
+                text: textContent
+            });
+        }
+    }
+
     async function ensureGroupConnection() {
+        const sock = activeClient;
+        if (!sock) return false;
+
         // 1. Check local RAM/disk cache first
         if (memoryGroupId) {
             return true;
@@ -473,11 +523,11 @@ module.exports = (client, db) => {
                 }
 
                 console.log(`🔍 Fetching Group ID via Hugging Face Secret invite code (${inviteCode})...`);
-                const inviteInfo = await client.groupGetInviteInfo(inviteCode);
+                // Baileys equivalent for client.getInviteInfo(inviteCode)
+                const inviteInfo = await sock.groupGetInviteInfo(inviteCode);
 
                 if (inviteInfo && inviteInfo.id) {
-                    const rawId = String(inviteInfo.id);
-                    const fetchedGroupId = rawId.endsWith('@g.us') ? rawId : `${rawId}@g.us`; // Baileys uses @g.us for groups natively
+                    const fetchedGroupId = inviteInfo.id._serialized || inviteInfo.id;
                     console.log(`✅ Group ID successfully resolved & saved: ${fetchedGroupId}`);
                     saveGroupMemory(fetchedGroupId);
                     return true;
@@ -488,26 +538,26 @@ module.exports = (client, db) => {
                 console.error(`⚠️ Failed to resolve Group ID from Secret invite code: ${err.message}`);
             }
         } else {
-            console.log("ℹ️ No GROUP_INVITE_CODE found in Secrets. Defaulting to DOM chat scanning...");
+            console.log("ℹ️ No GROUP_INVITE_CODE found in Secrets. Defaulting to participating group scanning...");
         }
 
-        // 3. Fallback: Scan recent participating groups
+        // 3. Fallback: Scan participating groups in Baileys (replaces client.getChats())
         try {
-            console.log("🔍 Scanning chat list for target group...");
-            const groups = await client.groupFetchAllParticipating();
-            const groupChats = Object.values(groups);
-            
-            if (groupChats.length > 0) {
-                const foundId = groupChats[0].id;
-                console.log(`✅ Found group via chat scan: ${foundId}`);
+            console.log("🔍 Scanning participating groups for target group...");
+            const groupsObj = await sock.groupFetchAllParticipating();
+            const groupIds = groupsObj ? Object.keys(groupsObj) : [];
+
+            if (groupIds.length > 0) {
+                const foundId = groupIds[0];
+                console.log(`✅ Found group via Baileys group scan: ${foundId} (${groupsObj[foundId]?.subject || 'Group'})`);
                 saveGroupMemory(foundId);
                 return true;
             } else {
-                console.log("⚠️ No group chat found in recent chat list.");
+                console.log("⚠️ No group chat found in participating groups list.");
                 return false;
             }
         } catch (err) {
-            console.error(`⚠️ DOM chat scan failed: ${err.message}`);
+            console.error(`⚠️ Group chat scan failed: ${err.message}`);
             return false;
         }
     }
@@ -559,11 +609,10 @@ module.exports = (client, db) => {
         finalMessage += `━━━━━━━━━━━━━━━━━━\n_🤖 System Generated Message_`;
 
         try {
+            await sendGroupMessageWithMedia(memoryGroupId, finalMessage, imagePath);
+            
             if (imagePath && fs.existsSync(imagePath)) {
-                await client.sendMessage(memoryGroupId, { image: { url: imagePath }, caption: finalMessage });
                 try { fs.unlinkSync(imagePath); } catch (e) {}
-            } else {
-                await client.sendMessage(memoryGroupId, { text: finalMessage });
             }
 
             // 🛡️ Blind Write to Firebase (1 Write, 0 Reads) - Bypass writing if it's a test
@@ -576,6 +625,9 @@ module.exports = (client, db) => {
             console.log(`✅ Morning Blast completed and logged for ${todayString}`);
         } catch (e) {
             console.error("⚠️ Message send failed:", e.message);
+            if (imagePath && fs.existsSync(imagePath)) {
+                try { fs.unlinkSync(imagePath); } catch (err) {}
+            }
             if (!force) cachedMorningDate = null; // Unlock so it can retry later
         }
     }
@@ -625,11 +677,10 @@ module.exports = (client, db) => {
         finalMessage += `━━━━━━━━━━━━━━━━━━\n_🤖 System Generated Message_`;
 
         try {
+            await sendGroupMessageWithMedia(memoryGroupId, finalMessage, imagePath);
+
             if (imagePath && fs.existsSync(imagePath)) {
-                await client.sendMessage(memoryGroupId, { image: { url: imagePath }, caption: finalMessage });
                 try { fs.unlinkSync(imagePath); } catch (e) {}
-            } else {
-                await client.sendMessage(memoryGroupId, { text: finalMessage });
             }
 
             // 🛡️ Blind Write to Firebase (1 Write, 0 Reads) - Bypass writing if it's a test
@@ -642,6 +693,9 @@ module.exports = (client, db) => {
             console.log(`✅ Evening Blast completed and logged for ${todayString}`);
         } catch (e) {
             console.error("⚠️ Message send failed:", e.message);
+            if (imagePath && fs.existsSync(imagePath)) {
+                try { fs.unlinkSync(imagePath); } catch (err) {}
+            }
             if (!force) cachedEveningDate = null; // Unlock so it can retry later
         }
     }
@@ -666,97 +720,120 @@ module.exports = (client, db) => {
         finalMessage += `━━━━━━━━━━━━━━━━━━\n_🤖 System Generated Message_`;
 
         try {
+            await sendGroupMessageWithMedia(memoryGroupId, finalMessage, imagePath);
+            
             if (imagePath && fs.existsSync(imagePath)) {
-                await client.sendMessage(memoryGroupId, { image: { url: imagePath }, caption: finalMessage });
                 try { fs.unlinkSync(imagePath); } catch (e) {}
-            } else {
-                await client.sendMessage(memoryGroupId, { text: finalMessage });
             }
         } catch (e) {
             console.error("⚠️ Message send failed:", e.message);
+            if (imagePath && fs.existsSync(imagePath)) {
+                try { fs.unlinkSync(imagePath); } catch (err) {}
+            }
         }
     }
 
     // ---------------------------------------------------------
-    // 8. ON-DEMAND TESTING COMMANDS (Admin Only)
+    // 8. ON-DEMAND TESTING COMMANDS (Baileys messages.upsert Listener)
     // ---------------------------------------------------------
-    client.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type !== 'notify') return;
-        const msg = messages[0];
-        
-        if (!msg.message || msg.key.fromMe) return;
-        
-        const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
-        if (!textMessage.toLowerCase().startsWith('!test')) return;
+    const attachTestCommandListener = (sockInstance) => {
+        if (!sockInstance || !sockInstance.ev || sockInstance._meenaOtherMessageListenerAttached) return;
+        sockInstance._meenaOtherMessageListenerAttached = true;
 
-        // Fix: In Baileys, participant handles group senders, remoteJid handles individual senders.
-        const sender = msg.key.participant || msg.key.remoteJid;
-        
-        // Security Check: Now allowing anyone as requested (previously restricted to admins)
-        const baileysAdmins = ADMIN_NUMBERS.map(n => n.replace('@c.us', '@s.whatsapp.net'));
-        if (!baileysAdmins.includes(sender)) {
-            console.log(`ℹ️ Test command attempt from non-admin/anyone: ${sender}. Allowing access.`);
-            // return; // Commented out to allow anyone to use the command
-        }
+        sockInstance.ev.on('messages.upsert', async ({ messages, type }) => {
+            if (type !== 'notify') return;
+            const msg = messages[0];
+            if (!msg || !msg.message || msg.key.remoteJid === 'status@broadcast' || msg.key.fromMe) return;
 
-        const args = textMessage.trim().split(' ');
-        const command = args[1] ? args[1].toLowerCase() : '';
-
-        // Helper functions for Baileys UI actions (Safely wrapped to prevent unhandled rejections on socket disconnect)
-        const react = async (emoji) => {
-            try {
-                if (!client) return;
-                await client.sendMessage(msg.key.remoteJid, { react: { text: emoji, key: msg.key } });
-            } catch (e) {
-                console.warn(`⚠️ Suppressed reaction error: ${e.message}`);
+            const chatJid = msg.key.remoteJid;
+            // If someone triggers `!test` inside a group chat and we don't have a cached group ID yet, save it automatically
+            if (chatJid && chatJid.endsWith('@g.us') && !memoryGroupId) {
+                saveGroupMemory(chatJid);
             }
-        };
 
-        const reply = async (text) => {
-            try {
-                if (!client) return;
-                await client.sendMessage(msg.key.remoteJid, { text }, { quoted: msg });
-            } catch (e) {
-                console.warn(`⚠️ Suppressed reply error: ${e.message}`);
+            const bodyText =
+                msg.message.conversation ||
+                msg.message.extendedTextMessage?.text ||
+                msg.message.imageMessage?.caption ||
+                msg.message.videoMessage?.caption ||
+                "";
+
+            if (!bodyText || !bodyText.trim().toLowerCase().startsWith('!test')) return;
+
+            // Fix: msg.key.participant resolves the actual person in a group. msg.key.remoteJid gets the group ID or DM ID.
+            const sender = msg.key.participant || msg.key.remoteJid;
+            
+            // Security Check: Now allowing anyone as requested (previously restricted to admins)
+            if (!ADMIN_NUMBERS.includes(sender)) {
+                console.log(`ℹ️ Test command attempt from non-admin/anyone: ${sender}. Allowing access.`);
+                // return; // Commented out to allow anyone to use the command
             }
-        };
 
-        try {
-            // Acknowledge receipt immediately with an hourglass reaction
-            await react('⏳'); 
+            const args = bodyText.trim().split(/\s+/);
+            const command = args[1] ? args[1].toLowerCase() : '';
 
-            if (command === 'morning') {
-                console.log(`🛠️ User ${sender} triggered manual morning test.`);
-                await sendMorningBlast(true); // FIXED: Pass true to bypass locks & Firebase
-                await react('✅');
-            } 
-            else if (command === 'evening') {
-                console.log(`🛠️ User ${sender} triggered manual evening test.`);
-                await sendEveningBlast(true); // FIXED: Pass true to bypass locks & Firebase
-                await react('✅');
-            } 
-            else if (command === 'festival') {
-                const festivalName = args.slice(2).join(' '); // Capture everything after "!test festival"
-                
-                if (!festivalName) {
-                    await reply('⚠️ Please provide a festival name. \nExample: *!test festival Diwali*');
-                    await react('❌');
-                    return;
+            // Helper functions for Baileys reactions and quoted replies
+            const reactToMsg = async (emoji) => {
+                try {
+                    await sockInstance.sendMessage(chatJid, {
+                        react: { text: emoji, key: msg.key }
+                    });
+                } catch (e) {}
+            };
+
+            const replyToMsg = async (text) => {
+                try {
+                    await sockInstance.sendMessage(chatJid, { text }, { quoted: msg });
+                } catch (e) {}
+            };
+
+            try {
+                // Acknowledge receipt immediately with an hourglass reaction
+                await reactToMsg('⏳'); 
+
+                if (command === 'morning') {
+                    console.log(`🛠️ User ${sender} triggered manual morning test.`);
+                    await sendMorningBlast(true); // FIXED: Pass true to bypass locks & Firebase
+                    await reactToMsg('✅');
+                } 
+                else if (command === 'evening') {
+                    console.log(`🛠️ User ${sender} triggered manual evening test.`);
+                    await sendEveningBlast(true); // FIXED: Pass true to bypass locks & Firebase
+                    await reactToMsg('✅');
+                } 
+                else if (command === 'festival') {
+                    const festivalName = args.slice(2).join(' '); // Capture everything after "!test festival"
+                    
+                    if (!festivalName) {
+                        await replyToMsg('⚠️ Please provide a festival name. \nExample: *!test festival Diwali*');
+                        await reactToMsg('❌');
+                        return;
+                    }
+                    
+                    console.log(`🛠️ User ${sender} triggered manual festival test for: ${festivalName}`);
+                    await sendForcedFestivalBlast(festivalName);
+                    await reactToMsg('✅');
+                } 
+                else {
+                    await replyToMsg('ℹ️ *Available Test Commands:*\n\n1️⃣ `!test morning`\n2️⃣ `!test evening`\n3️⃣ `!test festival [Name]`');
+                    await reactToMsg('❓');
                 }
-                
-                console.log(`🛠️ User ${sender} triggered manual festival test for: ${festivalName}`);
-                await sendForcedFestivalBlast(festivalName);
-                await react('✅');
-            } 
-            else {
-                await reply('ℹ️ *Available Test Commands:*\n\n1️⃣ `!test morning`\n2️⃣ `!test evening`\n3️⃣ `!test festival [Name]`');
-                await react('❓');
+            } catch (err) {
+                console.error(`⚠️ Test command failed: ${err.message}`);
+                await reactToMsg('❌');
             }
-        } catch (err) {
-            console.error(`⚠️ Test command failed: ${err.message}`);
-            await react('❌');
-        }
-    });
+        });
+    };
+
+    attachTestCommandListener(client);
+
+    // Prevent duplicate cron jobs & watchdog intervals if module is ever re-invoked on reconnect
+    if (isOtherModuleInitialized || global.isOtherModuleInitialized) {
+        console.log("🛡️ [other.js] Cron schedulers & Watchdog already active. Updated socket reference only.");
+        return;
+    }
+    isOtherModuleInitialized = true;
+    global.isOtherModuleInitialized = true;
 
     // ---------------------------------------------------------
     // 9. EXACT CRON SCHEDULERS
