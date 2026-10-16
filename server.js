@@ -93,159 +93,15 @@ let globalQRString = null;
 let globalSocket = null;
 let isSocketConnected = false;
 
-// --- SESSION BACKUP & EDGE-CASE STATE MANAGEMENT ---
-const SESSION_DIR = path.join(__dirname, 'whatsapp-session-baileys');
-const BACKUP_FILE_PATH = path.join(__dirname, 'whatsapp-session.json');
-let hasTriedRootBackup = false; // Prevents infinite restore loops if root backup is expired
-let isSessionExpired = false;
-let sessionExpiredMessage = "";
-let isRestoringSession = false;
-let lastConnectedTimestamp = 0; // Ensures keys are flushed before allowing download
-let waitingForAdminUpdate = {}; // State tracker for interactive admin number updates
-
-/**
- * Safely unpacks whatsapp-session.json into ./whatsapp-session-baileys on initial boot
- */
-function restoreSessionFromRootFile() {
-    const credsPath = path.join(SESSION_DIR, 'creds.json');
-    if (fs.existsSync(credsPath)) {
-        console.log("ℹ️ Active Baileys session directory found on disk. Using existing session.");
-        return true;
-    }
-
-    if (hasTriedRootBackup) {
-        console.log("ℹ️ Root backup was already attempted or bypassed in this lifecycle. Skipping restore.");
-        return false;
-    }
-
-    if (!fs.existsSync(BACKUP_FILE_PATH)) {
-        console.log("ℹ️ No 'whatsapp-session.json' found in root folder. Proceeding to QR generation.");
-        return false;
-    }
-
-    hasTriedRootBackup = true;
-    isRestoringSession = true;
-    console.log("📦 Found 'whatsapp-session.json' in root directory! Attempting automatic session restore...");
-
-    try {
-        const rawContent = fs.readFileSync(BACKUP_FILE_PATH, 'utf-8');
-        if (!rawContent || !rawContent.trim()) {
-            throw new Error("Backup file is empty.");
-        }
-
-        const parsedBundle = JSON.parse(rawContent);
-        if (!parsedBundle || typeof parsedBundle !== 'object' || !parsedBundle['creds.json']) {
-            throw new Error("Backup JSON is missing mandatory 'creds.json' key.");
-        }
-
-        if (!fs.existsSync(SESSION_DIR)) {
-            fs.mkdirSync(SESSION_DIR, { recursive: true });
-        }
-
-        let restoredCount = 0;
-        for (const [fileName, fileData] of Object.entries(parsedBundle)) {
-            // Prevent path traversal and only restore valid JSON files
-            const safeFileName = path.basename(fileName);
-            if (!safeFileName.endsWith('.json')) continue;
-
-            const targetPath = path.join(SESSION_DIR, safeFileName);
-            const contentToWrite = typeof fileData === 'string' ? fileData : JSON.stringify(fileData, null, 2);
-            fs.writeFileSync(targetPath, contentToWrite, 'utf-8');
-            restoredCount++;
-        }
-
-        console.log(`✅ Successfully unpacked ${restoredCount} session files from 'whatsapp-session.json'!`);
-        return true;
-    } catch (err) {
-        console.error("❌ Failed to restore 'whatsapp-session.json':", err.message);
-        isRestoringSession = false;
-        isSessionExpired = true;
-        sessionExpiredMessage = "Uploaded whatsapp-session.json is corrupted or invalid. Please scan the QR code to log in again.";
-        
-        // Clean up any partial files
-        fs.rmSync(SESSION_DIR, { recursive: true, force: true });
-        try { fs.rmSync(BACKUP_FILE_PATH, { force: true }); } catch (e) {}
-        return false;
-    }
-}
-
-// --- NEW API ENDPOINT: Download Bundled Single-File Session (whatsapp-session.json) ---
-app.get('/api/download-session', (req, res) => {
-    try {
-        if (!isSocketConnected) {
-            return res.status(400).json({
-                success: false,
-                error: "WhatsApp is not currently connected. Please link your device first."
-            });
-        }
-
-        const credsPath = path.join(SESSION_DIR, 'creds.json');
-        if (!fs.existsSync(SESSION_DIR) || !fs.existsSync(credsPath)) {
-            return res.status(404).json({
-                success: false,
-                error: "Session files are still initializing on disk. Please wait a few seconds and try again."
-            });
-        }
-
-        const files = fs.readdirSync(SESSION_DIR);
-        const sessionBundle = {};
-
-        for (const file of files) {
-            if (file.endsWith('.json')) {
-                const fullPath = path.join(SESSION_DIR, file);
-                try {
-                    const rawData = fs.readFileSync(fullPath, 'utf-8');
-                    // Parse to verify file isn't mid-write or corrupted
-                    sessionBundle[file] = JSON.parse(rawData);
-                } catch (readErr) {
-                    console.warn(`⚠️ Skipping unreadable or mid-write session file during bundle: ${file}`);
-                }
-            }
-        }
-
-        if (!sessionBundle['creds.json']) {
-            return res.status(500).json({
-                success: false,
-                error: "Core 'creds.json' was busy being written. Please click download again in 2 seconds."
-            });
-        }
-
-        const payload = JSON.stringify(sessionBundle, null, 2);
-        res.setHeader('Content-Type', 'application/json');
-        res.setHeader('Content-Disposition', 'attachment; filename="whatsapp-session.json"');
-        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-        return res.send(payload);
-    } catch (error) {
-        console.error("❌ Failed to bundle session for download:", error);
-        return res.status(500).json({ success: false, error: "Internal error generating session file." });
-    }
-});
-
 // --- NEW API ENDPOINT: Force WA Client Restart for Fresh Code ---
 app.post('/api/refresh-code', async (req, res) => {
     try {
         isGeneratingNewCode = true; 
-        isSessionExpired = false;
-        sessionExpiredMessage = "";
-        isRestoringSession = false;
-        hasTriedRootBackup = true; // Bypass root backup when user manually forces a new QR
         console.log("🔄 Manual client restart requested for a fresh QR code...");
         
-        // Close existing socket cleanly if open
-        if (globalSocket) {
-            try { globalSocket.end(undefined); } catch (e) {}
-        }
-
-        // Remove Baileys session folder completely and remove stale root backup if writable
+        // Remove Baileys session folder completely
         fs.rmSync('./whatsapp-session-baileys', { recursive: true, force: true });
-        try {
-            if (fs.existsSync(BACKUP_FILE_PATH)) {
-                fs.rmSync(BACKUP_FILE_PATH, { force: true });
-            }
-        } catch (e) {}
-
         globalQRString = null;
-        isSocketConnected = false;
         
         setTimeout(startWhatsAppClient, 2000);
         res.json({ success: true });
@@ -257,68 +113,27 @@ app.post('/api/refresh-code', async (req, res) => {
 
 // --- NEW API ENDPOINT: Smart status checking ---
 app.get('/api/pairing-status', async (req, res) => {
-    const credsReady = fs.existsSync(path.join(SESSION_DIR, 'creds.json'));
-    const syncWaitCompleted = lastConnectedTimestamp > 0 && (Date.now() - lastConnectedTimestamp >= 2500);
-    const canDownloadSession = Boolean(isSocketConnected && credsReady && syncWaitCompleted);
-
     if (globalQRString) {
         isGeneratingNewCode = false; 
-        isRestoringSession = false;
         try {
             // Generate base64 dynamically from the Baileys QR string
             const qrBase64DataUrl = await qrcode.toDataURL(globalQRString, {
                 color: { dark: '#000000', light: '#ffffff' }
             });
-            res.json({
-                ready: true,
-                qr: qrBase64DataUrl,
-                linked: false,
-                sessionExpired: isSessionExpired,
-                expiredMessage: sessionExpiredMessage,
-                restoring: false,
-                canDownload: false
-            });
+            res.json({ ready: true, qr: qrBase64DataUrl, linked: false });
         } catch (err) {
             console.error("⚠️ QR Generation Error:", err.message);
-            res.json({
-                ready: false,
-                linked: false,
-                sessionExpired: isSessionExpired,
-                expiredMessage: sessionExpiredMessage,
-                restoring: false,
-                canDownload: false
-            });
+            res.json({ ready: false, linked: false });
         }
     } else {
         if (isGeneratingNewCode) {
-            res.json({
-                ready: false,
-                linked: false,
-                sessionExpired: false,
-                expiredMessage: "",
-                restoring: false,
-                canDownload: false
-            });
+            res.json({ ready: false, linked: false });
         } 
         else if (isSocketConnected) {
-            res.json({
-                ready: false,
-                linked: true,
-                sessionExpired: false,
-                expiredMessage: "",
-                restoring: false,
-                canDownload: canDownloadSession
-            });
+            res.json({ ready: false, linked: true });
         } 
         else {
-            res.json({
-                ready: false,
-                linked: false,
-                sessionExpired: isSessionExpired,
-                expiredMessage: sessionExpiredMessage,
-                restoring: isRestoringSession,
-                canDownload: false
-            });
+            res.json({ ready: false, linked: false });
         }
     }
 });
@@ -345,7 +160,7 @@ app.get('/', (req, res) => {
                 background-color: #131b26; padding: 40px 25px;
                 border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.5);
                 border: 1px solid #1e293b;
-                text-align: center; max-width: 420px; width: 88%;
+                text-align: center; max-width: 400px; width: 85%;
                 box-sizing: border-box;
             }
             h2 { 
@@ -366,13 +181,10 @@ app.get('/', (req, res) => {
                 background-color: #10b981; color: #0b111a;
                 border: none; padding: 14px 24px; border-radius: 24px;
                 font-weight: 700; font-size: 15px; cursor: pointer;
-                transition: all 0.2s; width: 100%; margin-bottom: 12px;
+                transition: background 0.2s; width: 100%; margin-bottom: 12px;
                 box-sizing: border-box;
-                display: inline-flex; align-items: center; justify-content: center; gap: 8px;
-                text-decoration: none;
             }
-            .btn:hover:not(:disabled) { background-color: #059669; color: #ffffff; }
-            .btn:active:not(:disabled) { transform: scale(0.99); }
+            .btn:active { background-color: #059669; }
             .btn-secondary {
                 background-color: transparent; color: #10b981;
                 border: 1px solid #10b981; padding: 14px 24px; border-radius: 24px;
@@ -385,32 +197,6 @@ app.get('/', (req, res) => {
                 border: 4px solid #1e293b; border-top: 4px solid #10b981;
                 border-radius: 50%; width: 45px; height: 45px;
                 animation: spin 1s linear infinite; margin: 0 auto 25px;
-            }
-            .alert-banner {
-                background-color: rgba(239, 68, 68, 0.12);
-                border: 1px solid rgba(239, 68, 68, 0.45);
-                color: #fca5a5;
-                padding: 12px 14px;
-                border-radius: 12px;
-                font-size: 13.5px;
-                line-height: 1.45;
-                margin-bottom: 20px;
-                text-align: left;
-                display: flex;
-                align-items: flex-start;
-                gap: 10px;
-            }
-            .alert-banner span.icon {
-                font-size: 18px;
-                line-height: 1;
-                margin-top: 1px;
-            }
-            .helper-note {
-                font-size: 12.5px;
-                color: #64748b;
-                margin-top: -4px;
-                margin-bottom: 18px;
-                line-height: 1.4;
             }
             .footer { margin-top: 25px; font-size: 12px; color: #64748b; font-weight: 500;}
             @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
@@ -438,80 +224,15 @@ app.get('/', (req, res) => {
         <script>
             let currentState = "INIT";
             let currentCode = "";
-            let currentExpiredState = false;
-            let currentCanDownload = false;
             
-            function renderCode(qrSrc, sessionExpired, expiredMessage) {
-                const expiredBanner = sessionExpired ? \`
-                    <div class="alert-banner">
-                        <span class="icon">⚠️</span>
-                        <div>
-                            <strong style="color: #f87171; display: block; margin-bottom: 2px;">Session Expired or Invalid</strong>
-                            \${expiredMessage || "Your previous WhatsApp session expired or was unlinked. Please scan the QR code below to log in again."}
-                        </div>
-                    </div>
-                \` : '';
-
+            function renderCode(qrSrc) {
                 document.getElementById('dynamic-content').innerHTML = \`
-                    \${expiredBanner}
-                    <p style="margin-bottom: 20px;">Open WhatsApp on your primary phone, navigate to <b>Linked Devices</b>, and scan the QR code below.</p>
+                    <p>Open WhatsApp on your primary phone, navigate to <b>Linked Devices</b>, and scan the QR code below.</p>
                     <div class="code-container">
                       <img src="\` + qrSrc + \`" alt="WhatsApp QR Code">
                     </div>
                     <button class="btn-secondary" id="refresh-btn" onclick="forceNewCode()">🔄 Generate New QR</button>
                 \`;
-            }
-
-            async function downloadSessionFile() {
-                const dlBtn = document.getElementById('download-session-btn');
-                const originalText = dlBtn ? dlBtn.innerHTML : '';
-                try {
-                    if (dlBtn) {
-                        dlBtn.innerHTML = '⏳ Preparing whatsapp-session.json...';
-                        dlBtn.disabled = true;
-                    }
-
-                    const response = await fetch('/api/download-session');
-                    if (!response.ok) {
-                        let errMsg = 'Failed to download session file.';
-                        try {
-                            const errData = await response.json();
-                            if (errData && errData.error) errMsg = errData.error;
-                        } catch (e) {}
-                        alert('⚠️ ' + errMsg);
-                        return;
-                    }
-
-                    const blob = await response.blob();
-                    const url = window.URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.style.display = 'none';
-                    a.href = url;
-                    a.download = 'whatsapp-session.json';
-                    document.body.appendChild(a);
-                    a.click();
-                    window.URL.revokeObjectURL(url);
-                    document.body.removeChild(a);
-
-                    if (dlBtn) {
-                        dlBtn.innerHTML = '✅ Downloaded whatsapp-session.json!';
-                        setTimeout(() => {
-                            if (document.getElementById('download-session-btn')) {
-                                document.getElementById('download-session-btn').innerHTML = '📥 Download Session File';
-                                document.getElementById('download-session-btn').disabled = false;
-                            }
-                        }, 3000);
-                        return;
-                    }
-                } catch (err) {
-                    console.error('Download error:', err);
-                    alert('⚠️ Network error while downloading session file.');
-                }
-
-                if (dlBtn) {
-                    dlBtn.innerHTML = originalText || '📥 Download Session File';
-                    dlBtn.disabled = false;
-                }
             }
 
             function forceNewCode() {
@@ -539,52 +260,29 @@ app.get('/', (req, res) => {
 
                         if (data.ready && data.qr) {
                             // Detected a pairing QR
-                            if (currentState !== 'CODE' || currentCode !== data.qr || currentExpiredState !== Boolean(data.sessionExpired)) {
+                            if (currentState !== 'CODE' || currentCode !== data.qr) {
                                 currentState = 'CODE';
                                 currentCode = data.qr;
-                                currentExpiredState = Boolean(data.sessionExpired);
-                                renderCode(data.qr, data.sessionExpired, data.expiredMessage);
+                                renderCode(data.qr);
                             }
                         } else if (data.linked) {
                             // Session connected
-                            const canDl = Boolean(data.canDownload);
-                            if (currentState !== 'LINKED' || currentCanDownload !== canDl) {
+                            if (currentState !== 'LINKED') {
                                 currentState = 'LINKED';
-                                currentCanDownload = canDl;
                                 container.innerHTML = \`
                                     <div class="success-icon">✅</div>
                                     <p style="color: #10b981; font-weight: bold; font-size: 22px; margin-bottom: 10px; display: flex; align-items: center; justify-content: center;"><span class="pulse"></span> Online</p>
-                                    <p style="margin-bottom: 22px;">Meena Marketing WhatsApp Server is securely connected and actively listening.</p>
-                                    <button class="btn" id="download-session-btn" onclick="downloadSessionFile()" \${canDl ? '' : 'disabled'}>
-                                        \${canDl ? '📥 Download Session File' : '⏳ Finalizing Session Keys...'}
-                                    </button>
-                                    <div class="helper-note">Upload <b>whatsapp-session.json</b> to your server root folder for automatic login on restart.</div>
-                                    <button class="btn-secondary" style="margin-top: 4px;" onclick="forceNewCode()">🔄 Re-Link Device</button>
+                                    <p>Meena Marketing WhatsApp Server is securely connected and actively listening.</p>
+                                    <button class="btn-secondary" style="margin-top: 15px;" onclick="forceNewCode()">🔄 Re-Link Device</button>
                                 \`;
                             }
                         } else {
-                            // Booting up or restoring session
-                            const waitStateKey = data.restoring ? 'WAITING_RESTORE' : (data.sessionExpired ? 'WAITING_EXPIRED' : 'WAITING');
-                            if (currentState !== waitStateKey) {
-                                currentState = waitStateKey;
-                                const expiredBanner = data.sessionExpired ? \`
-                                    <div class="alert-banner">
-                                        <span class="icon">⚠️</span>
-                                        <div>
-                                            <strong style="color: #f87171; display: block; margin-bottom: 2px;">Session Expired or Invalid</strong>
-                                            \${data.expiredMessage || "Previous session expired. Generating a fresh QR code..."}
-                                        </div>
-                                    </div>
-                                \` : '';
-
-                                const statusMsg = data.restoring
-                                    ? "Restoring saved session from <b>whatsapp-session.json</b>...<br><br>Logging in automatically..."
-                                    : "The system is generating the QR Code.<br><br>Waiting for WhatsApp Engine...";
-
+                            // Booting up
+                            if (currentState !== 'WAITING') {
+                                currentState = 'WAITING';
                                 container.innerHTML = \`
-                                    \${expiredBanner}
                                     <div class="loader"></div>
-                                    <p>\${statusMsg}</p>
+                                    <p>The system is generating the QR Code.<br><br>Waiting for WhatsApp Engine...</p>
                                 \`;
                             }
                         }
@@ -626,10 +324,6 @@ function getJid(phoneStr) {
 
 async function startWhatsAppClient() {
     console.log('🚀 Booting Baileys WhatsApp Client...');
-    
-    // Check and unpack root whatsapp-session.json if active session folder doesn't exist yet
-    restoreSessionFromRootFile();
-
     const { state, saveCreds } = await useMultiFileAuthState('whatsapp-session-baileys');
     
     const sock = makeWASocket({
@@ -646,56 +340,26 @@ async function startWhatsAppClient() {
 
         if (qr) {
             console.log('🔄 Authentication required. Capturing Baileys QR code string...');
-            isRestoringSession = false;
             globalQRString = qr;
         }
 
         if (connection === 'close') {
             isSocketConnected = false;
-            isRestoringSession = false;
-            lastConnectedTimestamp = 0;
-
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const isFatalSessionError =
-                statusCode === DisconnectReason.loggedOut ||
-                statusCode === DisconnectReason.badSession ||
-                statusCode === DisconnectReason.multideviceMismatch ||
-                statusCode === 401 ||
-                statusCode === 403 ||
-                statusCode === 411 ||
-                statusCode === 500;
-
-            const shouldReconnect = !isFatalSessionError;
-            console.log('Connection closed due to:', lastDisconnect?.error, ', statusCode:', statusCode, ', reconnecting:', shouldReconnect);
+            const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
+            console.log('Connection closed due to:', lastDisconnect.error, ', reconnecting:', shouldReconnect);
             
             if (shouldReconnect) {
                 setTimeout(startWhatsAppClient, 5000);
             } else {
-                console.log('⚠️ Session expired, invalid, or logged out. Wiping session and requesting a new QR code.');
-                isSessionExpired = true;
-                sessionExpiredMessage = statusCode === DisconnectReason.loggedOut
-                    ? "Your WhatsApp session was logged out or unlinked from your phone. Please scan the QR code to reconnect."
-                    : "The saved WhatsApp session has expired or is invalid. Please scan the QR code to log in again.";
-                hasTriedRootBackup = true; // Prevent re-unpacking the dead root whatsapp-session.json
-
+                console.log('User logged out. Please request a new QR code.');
                 fs.rmSync('./whatsapp-session-baileys', { recursive: true, force: true });
-                try {
-                    if (fs.existsSync(BACKUP_FILE_PATH)) {
-                        fs.rmSync(BACKUP_FILE_PATH, { force: true });
-                    }
-                } catch (e) {}
-
                 globalQRString = null;
                 setTimeout(startWhatsAppClient, 2000);
             }
         } else if (connection === 'open') {
             console.log('✅ Baileys WhatsApp is ready!');
             isSocketConnected = true;
-            isRestoringSession = false;
-            isSessionExpired = false;
-            sessionExpiredMessage = "";
             globalQRString = null;
-            lastConnectedTimestamp = Date.now();
             loadDynamicModules();
         }
     });
