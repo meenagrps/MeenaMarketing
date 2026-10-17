@@ -1,4 +1,4 @@
-const { makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
 const admin = require('firebase-admin');
 const express = require('express');
 const fs = require('fs');
@@ -104,6 +104,29 @@ let sessionExpiredMessage = "";
 let isRestoringSession = false;
 let lastConnectedTimestamp = 0; // Ensures keys are flushed before allowing download
 let waitingForAdminUpdate = {}; // State tracker for interactive admin number updates
+
+// --- ADVANCED CONNECTION LOCK, STRIKE COUNTER & SOCKET WAIT HELPERS ---
+let isStartingClient = false;
+let reconnectTimeout = null;
+let badSessionStrikeCount = 0;
+const MAX_BAD_SESSION_STRIKES = 4;
+
+function scheduleSafeReconnect(delayMs) {
+    if (reconnectTimeout) clearTimeout(reconnectTimeout);
+    reconnectTimeout = setTimeout(() => {
+        reconnectTimeout = null;
+        startWhatsAppClient();
+    }, delayMs);
+}
+
+async function waitForSocketReady(maxWaitMs = 15000) {
+    const start = Date.now();
+    while (Date.now() - start < maxWaitMs) {
+        if (globalSocket && isSocketConnected) return true;
+        await new Promise(res => setTimeout(res, 500));
+    }
+    return Boolean(globalSocket && isSocketConnected);
+}
 
 // COMPLETELY SILENT LOGGER: Prevents Baileys from printing encryption key spam
 const silentLogger = pino({ level: 'silent' });
@@ -236,6 +259,12 @@ app.post('/api/refresh-code', async (req, res) => {
         sessionExpiredMessage = "";
         isRestoringSession = false;
         hasTriedRootBackup = true; // Bypass root backup when user manually forces a new QR
+        badSessionStrikeCount = 0;
+        isStartingClient = false;
+        if (reconnectTimeout) {
+            clearTimeout(reconnectTimeout);
+            reconnectTimeout = null;
+        }
         console.log("🔄 Manual client restart requested for a fresh QR code...");
         
         // Close existing socket cleanly if open to prevent ghost sessions
@@ -243,6 +272,7 @@ app.post('/api/refresh-code', async (req, res) => {
             try { 
                 globalSocket.ev.removeAllListeners();
                 if (globalSocket.ws) globalSocket.ws.close(); 
+                globalSocket.end(undefined);
             } catch (e) {}
         }
 
@@ -258,7 +288,7 @@ app.post('/api/refresh-code', async (req, res) => {
         isSocketConnected = false;
         global.isWhatsAppConnected = false;
         
-        setTimeout(startWhatsAppClient, 2000);
+        scheduleSafeReconnect(2000);
         res.json({ success: true });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
@@ -634,290 +664,356 @@ function getJid(phoneStr) {
 }
 
 async function startWhatsAppClient() {
+    if (isStartingClient) {
+        console.log('⏳ [GUARD] Baileys client initialization already in progress. Skipping duplicate boot...');
+        return;
+    }
+    isStartingClient = true;
+
     console.log('🚀 Booting Baileys WhatsApp Client...');
     
-    // Check and unpack root whatsapp-session.json if active session folder doesn't exist yet
-    restoreSessionFromRootFile();
-
-    const { state, saveCreds } = await useMultiFileAuthState('whatsapp-session-baileys');
-    
-    const sock = makeWASocket({
-        auth: state,
-        logger: silentLogger, // Completely disables all Baileys internal logging/encryption spam
-        browser: Browsers.macOS('Desktop'),
-        printQRInTerminal: false
-    });
-
-    globalSocket = sock;
-
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect, qr } = update;
-
-        if (qr) {
-            // ADVANCED FIX: Only log when a completely NEW QR is generated to stop terminal spam
-            if (globalQRString !== qr) {
-                console.log('🔄 Waiting for device pairing. Capture the QR code from the Web Dashboard...');
-            }
-            isRestoringSession = false;
-            globalQRString = qr;
+    try {
+        // Safely clean up any dangling previous socket before creating a new one
+        if (globalSocket) {
+            try {
+                globalSocket.ev.removeAllListeners();
+                if (globalSocket.ws) globalSocket.ws.close();
+                globalSocket.end(undefined);
+            } catch (cleanupErr) {}
         }
 
-        if (connection === 'close') {
-            isSocketConnected = false;
-            global.isWhatsAppConnected = false; // Immediately notify background modules that socket is offline
-            isRestoringSession = false;
-            lastConnectedTimestamp = 0;
+        // Check and unpack root whatsapp-session.json if active session folder doesn't exist yet
+        restoreSessionFromRootFile();
 
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const shortError = lastDisconnect?.error?.message || 'Unknown network drop';
-            const isStreamError = shortError.toLowerCase().includes('stream errored') || shortError.toLowerCase().includes('restart required') || statusCode === 500 || statusCode === 515;
+        const { state, saveCreds } = await useMultiFileAuthState('whatsapp-session-baileys');
+        
+        const sock = makeWASocket({
+            auth: {
+                creds: state.creds,
+                // Cache Signal keys in RAM to prevent slow disk I/O 'Stream Errored (ack)' (Status 500) during Puppeteer spikes
+                keys: typeof makeCacheableSignalKeyStore === 'function'
+                    ? makeCacheableSignalKeyStore(state.keys, silentLogger)
+                    : state.keys
+            },
+            logger: silentLogger, // Completely disables all Baileys internal logging/encryption spam
+            browser: Browsers.macOS('Desktop'),
+            printQRInTerminal: false,
+            keepAliveIntervalMs: 25000,
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
+            retryRequestDelayMs: 2000,
+            markOnlineOnConnect: false,
+            syncFullHistory: false
+        });
 
-            // ADVANCED FIX: Do NOT treat status 500 (DisconnectReason.badSession / Stream Errored (ack)) as a fatal session wipe!
-            // Only wipe the session on explicit user logout (401), forbidden (403), or multidevice mismatch (411).
-            const isFatalSessionError =
-                !isStreamError && (
-                    statusCode === DisconnectReason.loggedOut ||
-                    (statusCode === DisconnectReason.badSession && statusCode !== 500) ||
-                    statusCode === DisconnectReason.multideviceMismatch ||
-                    statusCode === 401 ||
-                    statusCode === 403
-                ); 
+        globalSocket = sock;
+        isStartingClient = false;
 
-            const shouldReconnect = !isFatalSessionError;
-            
-            // ADVANCED FIX: Cleanly destroy the ghost socket to stop memory leaks and overlapping file writes
-            try {
-                sock.ev.removeAllListeners();
-                if (sock.ws) sock.ws.close();
-            } catch (e) {}
+        sock.ev.on('connection.update', (update) => {
+            const { connection, lastDisconnect, qr } = update;
 
-            if (shouldReconnect) {
-                // Suppress spammy QR timeout logs from cluttering the console
-                if (shortError !== 'QR refs attempts ended') {
-                    console.log(`🔌 Connection dropped (${shortError}). Status: ${statusCode}. Reconnecting in 5s...`);
+            if (qr) {
+                // ADVANCED FIX: Only log when a completely NEW QR is generated to stop terminal spam
+                if (globalQRString !== qr) {
+                    console.log('🔄 Waiting for device pairing. Capture the QR code from the Web Dashboard...');
                 }
-                setTimeout(startWhatsAppClient, 5000);
-            } else {
-                console.log(`⚠️ Fatal Session Error (${statusCode}). Wiping corrupted session and requesting a new QR...`);
-                isSessionExpired = true;
-                sessionExpiredMessage = statusCode === DisconnectReason.loggedOut
-                    ? "Your WhatsApp session was logged out or unlinked from your phone. Please scan the QR code to reconnect."
-                    : "The saved WhatsApp session has expired or is invalid. Please scan the QR code to log in again.";
-                hasTriedRootBackup = true; // Prevent re-unpacking the dead root whatsapp-session.json
+                isRestoringSession = false;
+                globalQRString = qr;
+            }
 
-                fs.rmSync('./whatsapp-session-baileys', { recursive: true, force: true });
+            if (connection === 'close') {
+                isSocketConnected = false;
+                global.isWhatsAppConnected = false; // Immediately notify background modules that socket is offline
+                isRestoringSession = false;
+                lastConnectedTimestamp = 0;
+
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const shortError = lastDisconnect?.error?.message || 'Unknown network drop';
+                const isStreamError = shortError.toLowerCase().includes('stream errored') || shortError.toLowerCase().includes('restart required') || statusCode === 500 || statusCode === 515;
+
+                // Track consecutive Status 500 strikes in case disk session files ever become genuinely corrupted
+                if (statusCode === 500 || statusCode === DisconnectReason.badSession) {
+                    badSessionStrikeCount++;
+                } else {
+                    badSessionStrikeCount = 0;
+                }
+
+                // ADVANCED FIX: Do NOT treat status 500 (DisconnectReason.badSession / Stream Errored (ack)) as a fatal session wipe
+                // unless it fails 4 consecutive times without ever opening!
+                // Only wipe the session on explicit user logout (401), forbidden (403), multidevice mismatch (411), or 4x unrecoverable 500s.
+                const isFatalSessionError =
+                    (statusCode === 500 && badSessionStrikeCount >= MAX_BAD_SESSION_STRIKES) ||
+                    (!isStreamError && (
+                        statusCode === DisconnectReason.loggedOut ||
+                        (statusCode === DisconnectReason.badSession && statusCode !== 500) ||
+                        statusCode === DisconnectReason.multideviceMismatch ||
+                        statusCode === 401 ||
+                        statusCode === 403
+                    )); 
+
+                const shouldReconnect = !isFatalSessionError;
+                
+                // ADVANCED FIX: Cleanly destroy the ghost socket to stop memory leaks and overlapping file writes
                 try {
-                    if (fs.existsSync(BACKUP_FILE_PATH)) {
-                        fs.rmSync(BACKUP_FILE_PATH, { force: true });
-                    }
+                    sock.ev.removeAllListeners();
+                    if (sock.ws) sock.ws.close();
+                    sock.end(undefined);
                 } catch (e) {}
 
-                globalQRString = null;
-                setTimeout(startWhatsAppClient, 2000);
-            }
-        } else if (connection === 'open') {
-            console.log('✅ Baileys WhatsApp is ready!');
-            isSocketConnected = true;
-            global.isWhatsAppConnected = true; // Notify background modules that socket is authenticated and open
-            isRestoringSession = false;
-            isSessionExpired = false;
-            sessionExpiredMessage = "";
-            globalQRString = null;
-            lastConnectedTimestamp = Date.now();
-            loadDynamicModules();
-        }
-    });
-
-    sock.ev.on('creds.update', saveCreds);
-    
-    // --- ATTACH MESSAGE LISTENER TO BAILEYS SOCKET ---
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type !== 'notify') return;
-        const msg = messages[0];
-        
-        // Ignore status broadcasts and bot's own messages
-        if (!msg.message || msg.key.remoteJid === 'status@broadcast' || msg.key.fromMe) return;
-
-        const senderJid = msg.key.remoteJid;
-        const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
-        if (!textMessage) return;
-
-        const input = textMessage.trim();
-        const normalizedInput = input.toLowerCase();
-
-        // Helper for quick replies in Baileys
-        const reply = async (text) => {
-            await sock.sendMessage(senderJid, { text }, { quoted: msg });
-        };
-
-        try { 
-            // -- ADMIN 1 REALTIME SALES TOGGLE FLOWS (HIGHLY OPTIMIZED WRITES) --
-            if (normalizedInput === 'admin 1 off') {
-                try {
-                    admin1AlertsEnabled = false;
-                    await db.collection('system_folder').doc('config').set({ admin1AlertsEnabled: false }, { merge: true });
-                    return reply("📴 *Admin 1 Sales Alerts Suspended.*\nYou will no longer receive messaging alerts when a sales transaction is completed.");
-                } catch (err) {
-                    return reply("⚠️ Error connecting to database.");
-                }
-            }
-
-            if (normalizedInput === 'admin 1 on') {
-                try {
-                    admin1AlertsEnabled = true;
-                    await db.collection('system_folder').doc('config').set({ admin1AlertsEnabled: true }, { merge: true });
-                    return reply("🔔 *Admin 1 Sales Alerts Restored.*\nYou will now seamlessly receive real-time updates for newly generated invoices.");
-                } catch (err) {
-                    return reply("⚠️ Error connecting to database.");
-                }
-            }
-
-            // -- A. Change Admin 1 Flow --
-            if (normalizedInput === 'change admin 1 number' || normalizedInput === 'change admin 1 phone number') {
-                waitingForAdminUpdate[senderJid] = 1;
-                return reply("🛡️ *Admin 1 Configuration*\nPlease enter the new Admin 1 Mobile Number.\n_(Example: 98765 43210 or +91 9876543210)_");
-            }
-
-            // -- B. Change Admin 2 Flow --
-            if (normalizedInput === 'change admin 2 number' || normalizedInput === 'change admin 2 phone number') {
-                waitingForAdminUpdate[senderJid] = 2;
-                return reply("🛡️ *Admin 2 Configuration*\nPlease enter the new Admin 2 Mobile Number.\n_(Example: 98765 43210 or +91 9876543210)_");
-            }
-
-            // -- Change Admin 3 Flow --
-            if (normalizedInput === 'change admin 3 number' || normalizedInput === 'change admin 3 phone number') {
-                waitingForAdminUpdate[senderJid] = 3;
-                return reply("🛡️ *Admin 3 Configuration*\nPlease enter the new Admin 3 Mobile Number.\n_(Example: 98765 43210 or +91 9876543210)_");
-            }
-
-            // -- Change Shop Number Flow --
-            if (normalizedInput === 'change shop number' || normalizedInput === 'change shop phone number') {
-                waitingForAdminUpdate[senderJid] = 'shop';
-                return reply("🏪 *Shop Configuration*\nPlease enter the new Shop Mobile Number.\n_(Example: 98765 43210 or +91 9876543210)_");
-            }
-
-            // -- C. List Admins Flow --
-            if (normalizedInput === 'list admin numbers' || normalizedInput === 'list admin phone number') {
-                return reply(`📋 *Current Admin Configuration*\n\n👑 *Admin 1:* ${currentAdminPhone1 || 'Not set'} (Alerts: ${admin1AlertsEnabled ? 'Enabled' : 'Muted'})\n👑 *Admin 2:* ${currentAdminPhone2 || 'Not set'}\n👑 *Admin 3:* ${currentAdminPhone3 || 'Not set'}\n🏪 *Shop:* ${currentShopPhone || 'Not set'}`);
-            }
-
-            // -- E. Remove Admin 1 Flow --
-            if (normalizedInput === 'remove admin 1 number' || normalizedInput === 'remove admin 1 phone number') {
-                try {
-                    await db.collection('system_folder').doc('config').set({ adminPhone1: null, adminPhone: null }, { merge: true });
-                    currentAdminPhone1 = null;
-                    return reply("🗑️ *Admin 1 Successfully Removed.*\nNo further alerts will be sent to this slot.");
-                } catch (err) {
-                    return reply("⚠️ Error updating database.");
-                }
-            }
-
-            // -- F. Remove Admin 2 Flow --
-            if (normalizedInput === 'remove admin 2 number' || normalizedInput === 'remove admin 2 phone number') {
-                try {
-                    await db.collection('system_folder').doc('config').set({ adminPhone2: null }, { merge: true });
-                    currentAdminPhone2 = null;
-                    return reply("🗑️ *Admin 2 Successfully Removed.*\nNo further alerts will be sent to this slot.");
-                } catch (err) {
-                    return reply("⚠️ Error updating database.");
-                }
-            }
-
-            // -- Remove Admin 3 Flow --
-            if (normalizedInput === 'remove admin 3 number' || normalizedInput === 'remove admin 3 phone number') {
-                try {
-                    await db.collection('system_folder').doc('config').set({ adminPhone3: null }, { merge: true });
-                    currentAdminPhone3 = null;
-                    return reply("🗑️ *Admin 3 Successfully Removed.*\nNo further alerts will be sent to this slot.");
-                } catch (err) {
-                    return reply("⚠️ Error updating database.");
-                }
-            }
-
-            // -- Remove Shop Number Flow --
-            if (normalizedInput === 'remove shop number' || normalizedInput === 'remove shop phone number') {
-                try {
-                    await db.collection('system_folder').doc('config').set({ shopPhone: null }, { merge: true });
-                    currentShopPhone = null;
-                    return reply("🗑️ *Shop Number Successfully Removed.*\nNo further alerts will be sent to this slot.");
-                } catch (err) {
-                    return reply("⚠️ Error updating database.");
-                }
-            }
-
-            // -- Process Admin Input --
-            if (waitingForAdminUpdate[senderJid]) {
-                const adminSlot = waitingForAdminUpdate[senderJid];
-                const formattedNewNumber = formatPhone(input);
-                
-                if (!formattedNewNumber) {
-                    return reply("❌ *Invalid Number Format.*\nPlease enter a valid 10-digit Indian number.");
-                }
-
-                try {
-                    if (adminSlot === 'shop') {
-                        await db.collection('system_folder').doc('config').set({ shopPhone: formattedNewNumber }, { merge: true });
-                        currentShopPhone = formattedNewNumber;
-                        delete waitingForAdminUpdate[senderJid];
-                        return reply(`✅ *Shop Number Successfully Updated*\nAll future inquiry confirmations will be sent to:\n*${formattedNewNumber}*`);
+                if (shouldReconnect) {
+                    // Edge Case: Another instance replaced connection (440) -> back off longer to avoid conflict loop
+                    if (statusCode === DisconnectReason.connectionReplaced || statusCode === 440) {
+                        console.warn('⚠️ Connection replaced by another instance (Status 440). Backing off for 45s...');
+                        scheduleSafeReconnect(45000);
+                        return;
                     }
 
-                    const fieldName = adminSlot === 1 ? 'adminPhone1' : (adminSlot === 2 ? 'adminPhone2' : 'adminPhone3');
-                    await db.collection('system_folder').doc('config').set({ [fieldName]: formattedNewNumber }, { merge: true });
-                    
-                    if (adminSlot === 1) currentAdminPhone1 = formattedNewNumber;
-                    else if (adminSlot === 2) currentAdminPhone2 = formattedNewNumber;
-                    else currentAdminPhone3 = formattedNewNumber;
-                    
-                    delete waitingForAdminUpdate[senderJid];
-                    
-                    return reply(`✅ *Admin ${adminSlot} Successfully Updated*\nAll future billing alerts will be sent to:\n*${formattedNewNumber}*`);
-                } catch (err) {
-                    return reply("⚠️ Error updating database.");
+                    // Edge Case: Fast 3.5s recovery for Stream Errored (500) or Restart Required (515)
+                    if (isStreamError) {
+                        console.log(`🔄 Stream/Restart disconnect (${shortError}, Status: ${statusCode}, Strike ${badSessionStrikeCount}/${MAX_BAD_SESSION_STRIKES}). Reconnecting in 3.5s...`);
+                        scheduleSafeReconnect(3500);
+                        return;
+                    }
+
+                    // Suppress spammy QR timeout logs from cluttering the console
+                    if (shortError !== 'QR refs attempts ended') {
+                        console.log(`🔌 Connection dropped (${shortError}). Status: ${statusCode}. Reconnecting in 5s...`);
+                    }
+                    scheduleSafeReconnect(5000);
+                } else {
+                    console.log(`⚠️ Fatal Session Error (${statusCode}). Wiping corrupted session and requesting a new QR...`);
+                    badSessionStrikeCount = 0;
+                    isSessionExpired = true;
+                    sessionExpiredMessage = statusCode === DisconnectReason.loggedOut
+                        ? "Your WhatsApp session was logged out or unlinked from your phone. Please scan the QR code to reconnect."
+                        : "The saved WhatsApp session has expired or is invalid. Please scan the QR code to log in again.";
+                    hasTriedRootBackup = true; // Prevent re-unpacking the dead root whatsapp-session.json
+
+                    fs.rmSync('./whatsapp-session-baileys', { recursive: true, force: true });
+                    try {
+                        if (fs.existsSync(BACKUP_FILE_PATH)) {
+                            fs.rmSync(BACKUP_FILE_PATH, { force: true });
+                        }
+                    } catch (e) {}
+
+                    globalQRString = null;
+                    scheduleSafeReconnect(2000);
                 }
+            } else if (connection === 'open') {
+                console.log('✅ Baileys WhatsApp is ready!');
+                badSessionStrikeCount = 0;
+                isSocketConnected = true;
+                global.isWhatsAppConnected = true; // Notify background modules that socket is authenticated and open
+                isRestoringSession = false;
+                isSessionExpired = false;
+                sessionExpiredMessage = "";
+                globalQRString = null;
+                lastConnectedTimestamp = Date.now();
+                loadDynamicModules();
             }
+        });
 
-            // -- D. Marketing Total Flow --
-            if (normalizedInput === 'marketing total') {
-                await reply("📊 _Calculating today's sales..._");
-                
-                try {
-                    const today = new Date();
-                    const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 0, 0, 0);
-                    const endOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59, 999);
+        sock.ev.on('creds.update', async () => {
+            try {
+                await saveCreds();
+            } catch (credErr) {
+                console.error('⚠️ Failed to save Baileys credentials:', credErr.message);
+            }
+        });
+        
+        // --- ATTACH MESSAGE LISTENER TO BAILEYS SOCKET ---
+        sock.ev.on('messages.upsert', async ({ messages, type }) => {
+            if (type !== 'notify') return;
+            const msg = messages[0];
+            
+            // Ignore status broadcasts and bot's own messages
+            if (!msg.message || msg.key.remoteJid === 'status@broadcast' || msg.key.fromMe) return;
 
-                    const q = await db.collection('sellings')
-                        .where('date', '>=', startOfDay)
-                        .where('date', '<=', endOfDay)
-                        .get();
+            const senderJid = msg.key.remoteJid;
+            const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
+            if (!textMessage) return;
 
-                    let cashTotal = 0;
-                    let onlineTotal = 0;
-                    let grandTotal = 0;
-                    let count = 0;
+            const input = textMessage.trim();
+            const normalizedInput = input.toLowerCase();
 
-                    q.forEach(doc => {
-                        const data = doc.data();
-                        const total = data.totals?.grand || 0;
-                        const mode = (data.paymentMode || data.paymentMethod || 'Cash').toLowerCase();
+            // Helper for quick replies in Baileys
+            const reply = async (text) => {
+                await sock.sendMessage(senderJid, { text }, { quoted: msg });
+            };
+
+            try { 
+                // -- ADMIN 1 REALTIME SALES TOGGLE FLOWS (HIGHLY OPTIMIZED WRITES) --
+                if (normalizedInput === 'admin 1 off') {
+                    try {
+                        admin1AlertsEnabled = false;
+                        await db.collection('system_folder').doc('config').set({ admin1AlertsEnabled: false }, { merge: true });
+                        return reply("📴 *Admin 1 Sales Alerts Suspended.*\nYou will no longer receive messaging alerts when a sales transaction is completed.");
+                    } catch (err) {
+                        return reply("⚠️ Error connecting to database.");
+                    }
+                }
+
+                if (normalizedInput === 'admin 1 on') {
+                    try {
+                        admin1AlertsEnabled = true;
+                        await db.collection('system_folder').doc('config').set({ admin1AlertsEnabled: true }, { merge: true });
+                        return reply("🔔 *Admin 1 Sales Alerts Restored.*\nYou will now seamlessly receive real-time updates for newly generated invoices.");
+                    } catch (err) {
+                        return reply("⚠️ Error connecting to database.");
+                    }
+                }
+
+                // -- A. Change Admin 1 Flow --
+                if (normalizedInput === 'change admin 1 number' || normalizedInput === 'change admin 1 phone number') {
+                    waitingForAdminUpdate[senderJid] = 1;
+                    return reply("🛡️ *Admin 1 Configuration*\nPlease enter the new Admin 1 Mobile Number.\n_(Example: 98765 43210 or +91 9876543210)_");
+                }
+
+                // -- B. Change Admin 2 Flow --
+                if (normalizedInput === 'change admin 2 number' || normalizedInput === 'change admin 2 phone number') {
+                    waitingForAdminUpdate[senderJid] = 2;
+                    return reply("🛡️ *Admin 2 Configuration*\nPlease enter the new Admin 2 Mobile Number.\n_(Example: 98765 43210 or +91 9876543210)_");
+                }
+
+                // -- Change Admin 3 Flow --
+                if (normalizedInput === 'change admin 3 number' || normalizedInput === 'change admin 3 phone number') {
+                    waitingForAdminUpdate[senderJid] = 3;
+                    return reply("🛡️ *Admin 3 Configuration*\nPlease enter the new Admin 3 Mobile Number.\n_(Example: 98765 43210 or +91 9876543210)_");
+                }
+
+                // -- Change Shop Number Flow --
+                if (normalizedInput === 'change shop number' || normalizedInput === 'change shop phone number') {
+                    waitingForAdminUpdate[senderJid] = 'shop';
+                    return reply("🏪 *Shop Configuration*\nPlease enter the new Shop Mobile Number.\n_(Example: 98765 43210 or +91 9876543210)_");
+                }
+
+                // -- C. List Admins Flow --
+                if (normalizedInput === 'list admin numbers' || normalizedInput === 'list admin phone number') {
+                    return reply(`📋 *Current Admin Configuration*\n\n👑 *Admin 1:* ${currentAdminPhone1 || 'Not set'} (Alerts: ${admin1AlertsEnabled ? 'Enabled' : 'Muted'})\n👑 *Admin 2:* ${currentAdminPhone2 || 'Not set'}\n👑 *Admin 3:* ${currentAdminPhone3 || 'Not set'}\n🏪 *Shop:* ${currentShopPhone || 'Not set'}`);
+                }
+
+                // -- E. Remove Admin 1 Flow --
+                if (normalizedInput === 'remove admin 1 number' || normalizedInput === 'remove admin 1 phone number') {
+                    try {
+                        await db.collection('system_folder').doc('config').set({ adminPhone1: null, adminPhone: null }, { merge: true });
+                        currentAdminPhone1 = null;
+                        return reply("🗑️ *Admin 1 Successfully Removed.*\nNo further alerts will be sent to this slot.");
+                    } catch (err) {
+                        return reply("⚠️ Error updating database.");
+                    }
+                }
+
+                // -- F. Remove Admin 2 Flow --
+                if (normalizedInput === 'remove admin 2 number' || normalizedInput === 'remove admin 2 phone number') {
+                    try {
+                        await db.collection('system_folder').doc('config').set({ adminPhone2: null }, { merge: true });
+                        currentAdminPhone2 = null;
+                        return reply("🗑️ *Admin 2 Successfully Removed.*\nNo further alerts will be sent to this slot.");
+                    } catch (err) {
+                        return reply("⚠️ Error updating database.");
+                    }
+                }
+
+                // -- Remove Admin 3 Flow --
+                if (normalizedInput === 'remove admin 3 number' || normalizedInput === 'remove admin 3 phone number') {
+                    try {
+                        await db.collection('system_folder').doc('config').set({ adminPhone3: null }, { merge: true });
+                        currentAdminPhone3 = null;
+                        return reply("🗑️ *Admin 3 Successfully Removed.*\nNo further alerts will be sent to this slot.");
+                    } catch (err) {
+                        return reply("⚠️ Error updating database.");
+                    }
+                }
+
+                // -- Remove Shop Number Flow --
+                if (normalizedInput === 'remove shop number' || normalizedInput === 'remove shop phone number') {
+                    try {
+                        await db.collection('system_folder').doc('config').set({ shopPhone: null }, { merge: true });
+                        currentShopPhone = null;
+                        return reply("🗑️ *Shop Number Successfully Removed.*\nNo further alerts will be sent to this slot.");
+                    } catch (err) {
+                        return reply("⚠️ Error updating database.");
+                    }
+                }
+
+                // -- Process Admin Input --
+                if (waitingForAdminUpdate[senderJid]) {
+                    const adminSlot = waitingForAdminUpdate[senderJid];
+                    const formattedNewNumber = formatPhone(input);
+                    
+                    if (!formattedNewNumber) {
+                        return reply("❌ *Invalid Number Format.*\nPlease enter a valid 10-digit Indian number.");
+                    }
+
+                    try {
+                        if (adminSlot === 'shop') {
+                            await db.collection('system_folder').doc('config').set({ shopPhone: formattedNewNumber }, { merge: true });
+                            currentShopPhone = formattedNewNumber;
+                            delete waitingForAdminUpdate[senderJid];
+                            return reply(`✅ *Shop Number Successfully Updated*\nAll future inquiry confirmations will be sent to:\n*${formattedNewNumber}*`);
+                        }
+
+                        const fieldName = adminSlot === 1 ? 'adminPhone1' : (adminSlot === 2 ? 'adminPhone2' : 'adminPhone3');
+                        await db.collection('system_folder').doc('config').set({ [fieldName]: formattedNewNumber }, { merge: true });
                         
-                        grandTotal += total;
-                        count++;
-
-                        if (mode === 'online') onlineTotal += total;
-                        else cashTotal += total;
-                    });
-
-                    const summaryMsg = `📈 *MEENA MARKETING - DAILY SUMMARY*\n📅 ${today.toLocaleDateString('en-IN')}\n\n🧾 *Total Invoices:* ${count}\n💵 *Cash Sales:* ₹${cashTotal.toLocaleString()}\n📱 *Online Sales:* ₹${onlineTotal.toLocaleString()}\n\n🏆 *GRAND TOTAL: ₹${grandTotal.toLocaleString()}*`;
-                    
-                    return reply(summaryMsg);
-
-                } catch (error) {
-                    return reply("⚠️ Could not fetch sales data right now.");
+                        if (adminSlot === 1) currentAdminPhone1 = formattedNewNumber;
+                        else if (adminSlot === 2) currentAdminPhone2 = formattedNewNumber;
+                        else currentAdminPhone3 = formattedNewNumber;
+                        
+                        delete waitingForAdminUpdate[senderJid];
+                        
+                        return reply(`✅ *Admin ${adminSlot} Successfully Updated*\nAll future billing alerts will be sent to:\n*${formattedNewNumber}*`);
+                    } catch (err) {
+                        return reply("⚠️ Error updating database.");
+                    }
                 }
-            }
-        } catch (globalMsgError) {}
-    });
+
+                // -- D. Marketing Total Flow --
+                if (normalizedInput === 'marketing total') {
+                    await reply("📊 _Calculating today's sales..._");
+                    
+                    try {
+                        const today = new Date();
+                        const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 0, 0, 0);
+                        const endOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59, 999);
+
+                        const q = await db.collection('sellings')
+                            .where('date', '>=', startOfDay)
+                            .where('date', '<=', endOfDay)
+                            .get();
+
+                        let cashTotal = 0;
+                        let onlineTotal = 0;
+                        let grandTotal = 0;
+                        let count = 0;
+
+                        q.forEach(doc => {
+                            const data = doc.data();
+                            const total = data.totals?.grand || 0;
+                            const mode = (data.paymentMode || data.paymentMethod || 'Cash').toLowerCase();
+                            
+                            grandTotal += total;
+                            count++;
+
+                            if (mode === 'online') onlineTotal += total;
+                            else cashTotal += total;
+                        });
+
+                        const summaryMsg = `📈 *MEENA MARKETING - DAILY SUMMARY*\n📅 ${today.toLocaleDateString('en-IN')}\n\n🧾 *Total Invoices:* ${count}\n💵 *Cash Sales:* ₹${cashTotal.toLocaleString()}\n📱 *Online Sales:* ₹${onlineTotal.toLocaleString()}\n\n🏆 *GRAND TOTAL: ₹${grandTotal.toLocaleString()}*`;
+                        
+                        return reply(summaryMsg);
+
+                    } catch (error) {
+                        return reply("⚠️ Could not fetch sales data right now.");
+                    }
+                }
+            } catch (globalMsgError) {}
+        });
+    } catch (bootErr) {
+        isStartingClient = false;
+        console.error('❌ Baileys Engine Failed to Start:', bootErr.message);
+        scheduleSafeReconnect(5000);
+    }
 }
 
 // ---------------------------------------------------------
@@ -976,6 +1072,7 @@ db.collection('sellings').where('createdAt', '>=', serverStartTime).onSnapshot(a
         if (change.type === 'added') {
             const billData = change.doc.data();
             if (billData.createdAt && billData.createdAt.toDate() < serverStartTime) return;
+            if (!globalSocket || !isSocketConnected) await waitForSocketReady(15000);
             if (!globalSocket || !isSocketConnected) return; // Prevent sending if socket is dead
             
             const invNo = billData.invoiceNo || 'N/A';
@@ -1079,6 +1176,7 @@ db.collection('ask').doc('ask').onSnapshot(async (docSnap) => {
         clickedDate = typeof askData.clickedTime.toDate === 'function' ? askData.clickedTime.toDate() : new Date(askData.clickedTime);
     }
     if (clickedDate && clickedDate < serverStartTime) return;
+    if (!globalSocket || !isSocketConnected) await waitForSocketReady(15000);
     if (!globalSocket || !isSocketConnected) return;
 
     if (!currentAdminPhone1) {
@@ -1164,6 +1262,7 @@ db.collection('alerts').doc('stock_reduction').onSnapshot(async (docSnap) => {
     let editTime = null;
     if (alertData.lastUpdated) editTime = new Date(alertData.lastUpdated);
     if (editTime && editTime < serverStartTime) return;
+    if (!globalSocket || !isSocketConnected) await waitForSocketReady(15000);
     if (!globalSocket || !isSocketConnected) return;
 
     const activeAdmins = [];
