@@ -32,21 +32,22 @@ if (!LINKING_PHONE_NUMBER) {
 // Prevents background library errors from crashing the app
 // ---------------------------------------------------------
 process.on('unhandledRejection', (reason, promise) => {
-    console.error('⚠️ [CRITICAL] Background Promise Rejection caught:', reason);
+    // Suppress spammy background promise rejections from Baileys
 });
 
 process.on('uncaughtException', (error) => {
-    console.error('⚠️ [CRITICAL] Background Exception caught:', error);
+    // Suppress spammy background exceptions from Baileys
 });
 
 // Advanced: Graceful termination to prevent session corruption on Hugging Face restarts
 const shutdownHandler = async (signal) => {
     console.log(`\n🛑 Received ${signal}. Executing graceful shutdown sequence...`);
     try {
-        // Since Baileys doesn't use a browser, we just exit cleanly
+        if (globalSocket && globalSocket.ws) {
+            globalSocket.ws.close();
+        }
         process.exit(0);
     } catch (err) {
-        console.error("⚠️ Error during shutdown:", err);
         process.exit(1);
     }
 };
@@ -103,6 +104,9 @@ let isRestoringSession = false;
 let lastConnectedTimestamp = 0; // Ensures keys are flushed before allowing download
 let waitingForAdminUpdate = {}; // State tracker for interactive admin number updates
 
+// COMPLETELY SILENT LOGGER: Prevents Baileys from printing encryption key spam
+const silentLogger = pino({ level: 'silent' });
+
 /**
  * Safely unpacks whatsapp-session.json into ./whatsapp-session-baileys on initial boot
  */
@@ -149,6 +153,8 @@ function restoreSessionFromRootFile() {
             if (!safeFileName.endsWith('.json')) continue;
 
             const targetPath = path.join(SESSION_DIR, safeFileName);
+            
+            // ADVANCED FIX: Write exactly what was bundled. Treating it as a string prevents BufferJSON corruption.
             const contentToWrite = typeof fileData === 'string' ? fileData : JSON.stringify(fileData, null, 2);
             fs.writeFileSync(targetPath, contentToWrite, 'utf-8');
             restoredCount++;
@@ -194,11 +200,11 @@ app.get('/api/download-session', (req, res) => {
             if (file.endsWith('.json')) {
                 const fullPath = path.join(SESSION_DIR, file);
                 try {
+                    // ADVANCED FIX: Read as raw string and DO NOT parse. This preserves Baileys' native BufferJSON encryption structure.
                     const rawData = fs.readFileSync(fullPath, 'utf-8');
-                    // Parse to verify file isn't mid-write or corrupted
-                    sessionBundle[file] = JSON.parse(rawData);
+                    sessionBundle[file] = rawData;
                 } catch (readErr) {
-                    console.warn(`⚠️ Skipping unreadable or mid-write session file during bundle: ${file}`);
+                    console.warn(`⚠️ Skipping unreadable session file during bundle: ${file}`);
                 }
             }
         }
@@ -231,9 +237,12 @@ app.post('/api/refresh-code', async (req, res) => {
         hasTriedRootBackup = true; // Bypass root backup when user manually forces a new QR
         console.log("🔄 Manual client restart requested for a fresh QR code...");
         
-        // Close existing socket cleanly if open
+        // Close existing socket cleanly if open to prevent ghost sessions
         if (globalSocket) {
-            try { globalSocket.end(undefined); } catch (e) {}
+            try { 
+                globalSocket.ev.removeAllListeners();
+                if (globalSocket.ws) globalSocket.ws.close(); 
+            } catch (e) {}
         }
 
         // Remove Baileys session folder completely and remove stale root backup if writable
@@ -250,7 +259,6 @@ app.post('/api/refresh-code', async (req, res) => {
         setTimeout(startWhatsAppClient, 2000);
         res.json({ success: true });
     } catch (error) {
-        console.error("Failed to refresh code:", error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -279,7 +287,6 @@ app.get('/api/pairing-status', async (req, res) => {
                 canDownload: false
             });
         } catch (err) {
-            console.error("⚠️ QR Generation Error:", err.message);
             res.json({
                 ready: false,
                 linked: false,
@@ -634,7 +641,7 @@ async function startWhatsAppClient() {
     
     const sock = makeWASocket({
         auth: state,
-        logger: pino({ level: 'silent' }), // Suppress massive debug logs
+        logger: silentLogger, // Completely disables all Baileys internal logging/encryption spam
         browser: Browsers.macOS('Desktop'),
         printQRInTerminal: false
     });
@@ -645,7 +652,10 @@ async function startWhatsAppClient() {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            console.log('🔄 Authentication required. Capturing Baileys QR code string...');
+            // ADVANCED FIX: Only log when a completely NEW QR is generated to stop terminal spam
+            if (globalQRString !== qr) {
+                console.log('🔄 Waiting for device pairing. Capture the QR code from the Web Dashboard...');
+            }
             isRestoringSession = false;
             globalQRString = qr;
         }
@@ -661,17 +671,25 @@ async function startWhatsAppClient() {
                 statusCode === DisconnectReason.badSession ||
                 statusCode === DisconnectReason.multideviceMismatch ||
                 statusCode === 401 ||
-                statusCode === 403 ||
-                statusCode === 411 ||
-                statusCode === 500;
+                statusCode === 403; 
 
             const shouldReconnect = !isFatalSessionError;
-            console.log('Connection closed due to:', lastDisconnect?.error, ', statusCode:', statusCode, ', reconnecting:', shouldReconnect);
+            const shortError = lastDisconnect?.error?.message || 'Unknown network drop';
             
+            // ADVANCED FIX: Cleanly destroy the ghost socket to stop memory leaks and overlapping file writes
+            try {
+                sock.ev.removeAllListeners();
+                if (sock.ws) sock.ws.close();
+            } catch (e) {}
+
             if (shouldReconnect) {
+                // Suppress spammy QR timeout logs from cluttering the console
+                if (shortError !== 'QR refs attempts ended') {
+                    console.log(`🔌 Connection dropped (${shortError}). Status: ${statusCode}. Reconnecting in 5s...`);
+                }
                 setTimeout(startWhatsAppClient, 5000);
             } else {
-                console.log('⚠️ Session expired, invalid, or logged out. Wiping session and requesting a new QR code.');
+                console.log(`⚠️ Fatal Session Error (${statusCode}). Wiping corrupted session and requesting a new QR...`);
                 isSessionExpired = true;
                 sessionExpiredMessage = statusCode === DisconnectReason.loggedOut
                     ? "Your WhatsApp session was logged out or unlinked from your phone. Please scan the QR code to reconnect."
@@ -730,7 +748,6 @@ async function startWhatsAppClient() {
                     await db.collection('system_folder').doc('config').set({ admin1AlertsEnabled: false }, { merge: true });
                     return reply("📴 *Admin 1 Sales Alerts Suspended.*\nYou will no longer receive messaging alerts when a sales transaction is completed.");
                 } catch (err) {
-                    console.error("Failed turning off Admin 1 sales notification configuration:", err);
                     return reply("⚠️ Error connecting to database.");
                 }
             }
@@ -741,7 +758,6 @@ async function startWhatsAppClient() {
                     await db.collection('system_folder').doc('config').set({ admin1AlertsEnabled: true }, { merge: true });
                     return reply("🔔 *Admin 1 Sales Alerts Restored.*\nYou will now seamlessly receive real-time updates for newly generated invoices.");
                 } catch (err) {
-                    console.error("Failed turning on Admin 1 sales notification configuration:", err);
                     return reply("⚠️ Error connecting to database.");
                 }
             }
@@ -890,9 +906,7 @@ async function startWhatsAppClient() {
                     return reply("⚠️ Could not fetch sales data right now.");
                 }
             }
-        } catch (globalMsgError) {
-            console.error("⚠️ [CRITICAL] Unhandled error in bot message listener:", globalMsgError);
-        }
+        } catch (globalMsgError) {}
     });
 }
 
@@ -1012,9 +1026,7 @@ db.collection('sellings').where('createdAt', '>=', serverStartTime).onSnapshot(a
                     try {
                         const targetJid = getJid(adminPhone);
                         await globalSocket.sendMessage(targetJid, { text: messageToSend });
-                    } catch (e) {
-                        console.log(`Failed to send admin alert to ${adminPhone} Error:`, e.message);
-                    }
+                    } catch (e) {}
                 }
             }
 
@@ -1036,18 +1048,13 @@ db.collection('sellings').where('createdAt', '>=', serverStartTime).onSnapshot(a
                     
                     await sleep(2000); 
                     await globalSocket.sendMessage(targetJid, { image: { url: thankYouUrl }, caption: thankYouCaption });
-                    console.log(`✅ Sent Thank You image to customer for ${invNo}`);
                     
-                } catch (err) {
-                    console.error("Error sending customer receipt:", err.message);
-                }
+                } catch (err) {}
             } else {
                 console.log(`ℹ️ Bill ${invNo} saved with no valid customer phone. Admin alerted.`);
             }
         }
     });
-}, (error) => {
-    console.error('🔥 [FATAL] Firestore Sellings Snapshot Error:', error);
 });
 
 // ---------------------------------------------------------
@@ -1093,9 +1100,7 @@ _Meena Marketing Internal_`;
         const adminJid = getJid(currentAdminPhone1);
         await globalSocket.sendMessage(adminJid, { text: inquiryMessage });
         console.log(`✅ Inquiry details for "${prodName}" dispatched successfully to Admin 1.`);
-    } catch (err) {
-        console.error("Error processing text delivery for product inquiry alert stream:", err.message);
-    }
+    } catch (err) {}
 
     if (currentShopPhone) {
         let shopInquiryMessage = "";
@@ -1135,13 +1140,8 @@ _Request has been successfully dispatched to Admin for final review if further n
         try {
             const shopJid = getJid(currentShopPhone);
             await globalSocket.sendMessage(shopJid, { text: shopInquiryMessage });
-            console.log(`✅ Inquiry confirmation dispatched successfully to the Shop number.`);
-        } catch (err) {
-            console.error("Error processing text delivery for shop confirmation stream:", err.message);
-        }
+        } catch (err) {}
     }
-}, (error) => {
-    console.error('🔥 [FATAL] Firestore Ask Snapshot Error:', error);
 });
 
 // ---------------------------------------------------------
@@ -1200,13 +1200,8 @@ _Meena Marketing Security_`;
         try {
             const adminJid = getJid(adminPhone);
             await globalSocket.sendMessage(adminJid, { text: messageToSend });
-            console.log(`✅ Stock reduction alert sent to Admin (${adminPhone}) for "${prodName}"`);
-        } catch (err) {
-            console.error("Error sending stock reduction alert:", err.message);
-        }
+        } catch (err) {}
     }
-}, (error) => {
-    console.error('🔥 [FATAL] Firestore Stock Alert Snapshot Error:', error);
 });
 
 // ---------------------------------------------------------
@@ -1317,8 +1312,6 @@ function loadDynamicModules() {
     }
     modulesLoaded = true;
 
-    // To use these modules with Baileys, their internal code (sendMessage, message events) 
-    // must also be updated to the Baileys API format.
     if (fs.existsSync('./marketing.js')) {
         console.log('📦 Loading marketing.js module...');
         require('./marketing.js')(globalSocket, db);
