@@ -49,6 +49,18 @@ module.exports = (client, db) => {
     const sleep = (ms) => new Promise(res => setTimeout(res, ms));
 
     /**
+     * Checks if the active Baileys socket is genuinely connected and open.
+     * Prevents calling sendMessage on a closed or reconnecting socket.
+     */
+    const isSocketReady = (sockInstance) => {
+        const s = sockInstance || activeClient;
+        if (!s || !s.user) return false;
+        if (typeof global.isWhatsAppConnected === 'boolean' && !global.isWhatsAppConnected) return false;
+        if (s.ws && typeof s.ws.readyState === 'number' && s.ws.readyState !== 1) return false;
+        return true;
+    };
+
+    /**
      * Converts any phone string, @c.us, or @lid into a valid Baileys JID (@s.whatsapp.net)
      */
     const toBaileysJid = (idOrPhone, fallbackPhone) => {
@@ -203,7 +215,7 @@ module.exports = (client, db) => {
 
     // --- NEW: HUMAN SIMULATED VIDEO SENDER (BAILEYS EDITION) ---
     const sendHumanVideo = async (sockClient, verifiedWhatsappId, customerName, actualPhone) => {
-        const sock = sockClient || activeClient;
+        let sock = activeClient || sockClient;
         try {
             console.log(`🎬 [Marketing] Preparing human-like video sequence for ${customerName} (${verifiedWhatsappId})...`);
             
@@ -250,6 +262,12 @@ module.exports = (client, db) => {
             
             while (sendRetries > 0 && !sent) {
                 try {
+                    // Refresh socket reference in case a reconnect happened during the 4s sleep
+                    sock = activeClient || sockClient;
+                    if (!isSocketReady(sock)) {
+                        throw new Error('Connection Closed');
+                    }
+
                     // Try to send native Video in Baileys
                     await sock.sendMessage(targetId, {
                         video: videoBuffer,
@@ -289,7 +307,7 @@ module.exports = (client, db) => {
     // --- NEW: HUMAN SIMULATED VOICE NOTE SENDER (BAILEYS NATIVE PTT EDITION) ---
     // ADDED actualPhone parameter to ensure we have the raw fallback number
     const sendHumanVoiceNote = async (sockClient, verifiedWhatsappId, customerName, actualPhone) => {
-        const sock = sockClient || activeClient;
+        let sock = activeClient || sockClient;
         try {
             console.log(`🎙️ [Marketing] Preparing human-like voice note sequence for ${customerName} (${verifiedWhatsappId})...`);
             
@@ -349,7 +367,10 @@ module.exports = (client, db) => {
             
             // 2. Trigger WhatsApp's "Recording Audio..." status at the top of the chat via Baileys
             try {
-                await sock.sendPresenceUpdate('recording', targetId);
+                sock = activeClient || sockClient;
+                if (isSocketReady(sock)) {
+                    await sock.sendPresenceUpdate('recording', targetId);
+                }
             } catch (e) {
                 console.log(`⚠️ [Marketing] Presence recording state skipped for ${targetId}. Proceeding with audio send.`);
             }
@@ -367,6 +388,12 @@ module.exports = (client, db) => {
             
             while (sendRetries > 0 && !sent) {
                 try {
+                    // Refresh socket reference in case a reconnect happened during the 40-50s recording simulation
+                    sock = activeClient || sockClient;
+                    if (!isSocketReady(sock)) {
+                        throw new Error('Connection Closed');
+                    }
+
                     // Try to send native Voice Note first (ptt: true makes it a real WhatsApp voice note)
                     await sock.sendMessage(targetId, {
                         audio: voiceBuffer,
@@ -442,6 +469,7 @@ module.exports = (client, db) => {
             const msg = messages[0];
             if (!msg || !msg.message || msg.key.remoteJid === 'status@broadcast' || msg.key.fromMe) return;
 
+            const currentSock = activeClient || sockInstance;
             const senderJid = msg.key.remoteJid;
             const rawText =
                 msg.message.conversation ||
@@ -454,7 +482,8 @@ module.exports = (client, db) => {
             const input = rawText.trim().toLowerCase();
 
             const reply = async (text) => {
-                await sockInstance.sendMessage(senderJid, { text }, { quoted: msg });
+                const liveSock = activeClient || sockInstance;
+                await liveSock.sendMessage(senderJid, { text }, { quoted: msg });
             };
             
             // OPT-OUT BLACKLIST HANDLER
@@ -482,6 +511,12 @@ module.exports = (client, db) => {
             }
 
             if (input === 'generate image' || input === 'generate ad' || input === '!generate image') {
+                // Prevent duplicate overlapping manual generations from the same user
+                if (global.isGeneratingManualAd) {
+                    return reply("⏳ _A promotional sequence is already being generated and delivered. Please wait a moment..._");
+                }
+                global.isGeneratingManualAd = true;
+
                 await reply("🎨 _Digital Agent is designing a new promotional poster... Please wait._");
                 
                 try {
@@ -489,26 +524,29 @@ module.exports = (client, db) => {
                     const customerName = msg.pushName || 'Valued Customer';
                     
                     const adData = generateRandomAdData();
-                    const imageBuffer = await generateAdImage(sockInstance, customerName, adData);
+                    const imageBuffer = await generateAdImage(currentSock, customerName, adData);
                     const caption = getBilingualCaption(customerName, adData);
                     
                     // ENTERPRISE FIX: Give connection time to settle before sending
                     await sleep(2000);
-                    await sockInstance.sendMessage(senderJid, {
+                    const liveSock = activeClient || currentSock;
+                    await liveSock.sendMessage(senderJid, {
                         image: imageBuffer,
                         caption: caption
                     });
                     
                     // NEW FEATURE: Append the dynamic video to manual triggers
-                    await sendHumanVideo(sockInstance, senderJid, customerName, senderJid);
+                    await sendHumanVideo(liveSock, senderJid, customerName, senderJid);
 
                     // NEW FEATURE: Append the dynamic voice note to manual triggers as well
                     // UPDATED: Passed senderJid as the 4th parameter for the fallback routing
-                    await sendHumanVoiceNote(sockInstance, senderJid, customerName, senderJid);
+                    await sendHumanVoiceNote(liveSock, senderJid, customerName, senderJid);
                     
                 } catch (err) {
                     console.error("Manual Ad Generation Error:", err.stack || err);
                     await reply("⚠️ Error generating image. Server might be busy.");
+                } finally {
+                    global.isGeneratingManualAd = false;
                 }
             }
         });
@@ -533,9 +571,9 @@ module.exports = (client, db) => {
         if (isProcessing) return;
         isProcessing = true;
         
-        // ADVANCED FIX: Ensure socket is active and authenticated before running background marketing loops
-        if (!activeClient || !activeClient.user) {
-            console.log("⚠️ WhatsApp client not authenticated. Pausing marketing engine.");
+        // ADVANCED FIX: Ensure socket is active, genuinely open, and authenticated before running background marketing loops
+        if (!isSocketReady(activeClient)) {
+            console.log("⚠️ WhatsApp client not authenticated or disconnected. Pausing marketing engine.");
             isProcessing = false;
             return;
         }
@@ -624,7 +662,7 @@ module.exports = (client, db) => {
     };
 
     const runDistributionCycle = async (dbData) => {
-        const sock = activeClient;
+        let sock = activeClient;
         const todayStr = new Date().toLocaleDateString('en-IN');
         const currentDayOfWeek = new Date().getDay(); // 0 is Sunday
         
@@ -656,6 +694,13 @@ module.exports = (client, db) => {
             console.log("✅ [Marketing] Entire 30-Day Cycle Complete. Restarting database fetch.");
             // Wipe nextAllowedTime to force an immediate cycle reload
             await docRef.set({ nextAllowedTime: 0 }, { merge: true });
+            isProcessing = false;
+            return;
+        }
+
+        // Verify socket is still live before starting customer processing
+        if (!isSocketReady(sock)) {
+            console.log("⚠️ [Marketing] Socket disconnected before cycle start. Aborting cycle safely.");
             isProcessing = false;
             return;
         }
@@ -700,6 +745,10 @@ module.exports = (client, db) => {
         try {
             // ENTERPRISE FIX: Use Baileys sock.onWhatsApp() to verify registry natively
             await sleep(3000); 
+            sock = activeClient;
+            if (!isSocketReady(sock)) {
+                throw new Error('Connection Closed');
+            }
             const results = await sock.onWhatsApp(plainPhone);
             const contactResult = Array.isArray(results) ? results[0] : null;
             
@@ -709,33 +758,38 @@ module.exports = (client, db) => {
         } catch(e) { 
             // 🚀 ADVANCED FIX IMPLEMENTED HERE: Handle socket/connection hiccups gracefully
             const errorStr = e.message || '';
-            if(
+            if (errorStr.includes('Connection Closed') || errorStr.includes('Timed Out') || !isSocketReady(activeClient)) {
+                // Socket is genuinely dead/reconnecting! Do NOT proceed to send or move to graveyard.
+                console.log(`⚠️ [Marketing] Socket disconnected during validation for ${plainPhone}. Deferring until reconnect.`);
+                isTransientError = true;
+            } else if(
                 errorStr.includes('WidFactory') ||
                 errorStr.includes('Evaluation failed') ||
                 errorStr.includes('findChat') ||
-                errorStr.includes('window.require is not a function') ||
-                errorStr.includes('Connection Closed') ||
-                errorStr.includes('Timed Out')
+                errorStr.includes('window.require is not a function')
             ) {
                 console.log(`⚠️ [Marketing] Validation query sync hiccup for ${plainPhone}. Proceeding with dynamic fallback JID.`);
                 verifiedWhatsappId = plainPhone + '@s.whatsapp.net';
             } else {
                 console.error(`🚨 [CRITICAL] Unhandled WhatsApp exception during number validation:`, e.stack || e);
-                throw e; 
+                isTransientError = true;
             }
         }
             
-        if (!verifiedWhatsappId) {
+        if (!verifiedWhatsappId && !isTransientError) {
             console.log(`🪦 [Marketing] Number ${formattedPhone} is not on WhatsApp. Moving to Graveyard.`);
             dbData.invalidNumbers.push(formattedPhone);
-        } else {
+        } else if (verifiedWhatsappId && !isTransientError) {
             // --- HUMAN SIMULATION (BAILEYS PRESENCE) ---
             try {
                 // ENTERPRISE FIX: Send "typing..." state for 5-8 seconds before sending poster
                 await sleep(2000);
-                await sock.sendPresenceUpdate('composing', verifiedWhatsappId);
-                await sleep(Math.floor(Math.random() * 3000) + 5000); // Type for 5-8 seconds
-                await sock.sendPresenceUpdate('paused', verifiedWhatsappId);
+                sock = activeClient;
+                if (isSocketReady(sock)) {
+                    await sock.sendPresenceUpdate('composing', verifiedWhatsappId);
+                    await sleep(Math.floor(Math.random() * 3000) + 5000); // Type for 5-8 seconds
+                    await sock.sendPresenceUpdate('paused', verifiedWhatsappId);
+                }
             } catch (e) {
                 console.log(`⚠️ Could not simulate typing for ${formattedPhone}, likely a new chat. Proceeding directly to send.`);
             }
@@ -754,7 +808,8 @@ module.exports = (client, db) => {
                     loopErrStr.includes('findChat') ||
                     loopErrStr.includes('window.require is not a function') ||
                     loopErrStr.includes('Connection Closed') ||
-                    loopErrStr.includes('Timed Out')
+                    loopErrStr.includes('Timed Out') ||
+                    !isSocketReady(activeClient)
                 ) {
                     isTransientError = true;
                 }
@@ -783,7 +838,9 @@ module.exports = (client, db) => {
             // NEW FIX: Re-queue the customer if it was a transient error instead of discarding them
             if (isTransientError) {
                 dbData.pendingCustomers.unshift(customer);
-                console.log(`♻️ [Marketing] Re-queued ${formattedPhone} due to internal WhatsApp syncing issue.`);
+                // Wait 2 minutes (120,000ms) on transient connection drops to prevent 6-second infinite crash loops while waiting for reconnect/QR
+                dbData.nextAllowedTime = Date.now() + 120000;
+                console.log(`♻️ [Marketing] Re-queued ${formattedPhone} due to internal WhatsApp syncing issue. Retrying in 2 minutes.`);
             }
         }
 
@@ -804,17 +861,17 @@ module.exports = (client, db) => {
 
         isProcessing = false; 
 
-        // SMART QUICK-TRIGGER: If we scheduled a fast 6-second retry, forcefully call the batch again 
+        // SMART QUICK-TRIGGER: If we scheduled a fast retry/skip (up to 2 minutes), forcefully call the batch again 
         // without waiting for the 30-minute global polling interval to catch up.
         const timeToNext = dbData.nextAllowedTime - Date.now();
-        if (timeToNext > 0 && timeToNext <= 60000) { // If wait time is under 1 minute (e.g. 6 seconds)
+        if (timeToNext > 0 && timeToNext <= 125000) { // Handles both 6s invalid-number skips and 120s transient reconnect waits
             if (global.marketingDynamicTimeout) clearTimeout(global.marketingDynamicTimeout);
             global.marketingDynamicTimeout = setTimeout(fetchAndPrepareBatch, timeToNext);
         }
     };
 
     const sendPromotion = async (customer, verifiedWhatsappId) => {
-        const sock = activeClient;
+        let sock = activeClient;
         // SAFEGUARD: Robustly handle both new Object and old String database formats
         const customerPhone = typeof customer === 'string' ? customer : customer?.phone;
         const customerName = typeof customer === 'string' ? 'Customer' : (customer?.name || 'Customer');
@@ -833,6 +890,12 @@ module.exports = (client, db) => {
 
             while (retries > 0 && !success) {
                 try {
+                    // Always grab latest socket reference in case Baileys reconnected during Puppeteer rendering
+                    sock = activeClient;
+                    if (!isSocketReady(sock)) {
+                        throw new Error('Connection Closed');
+                    }
+
                     await sock.sendMessage(targetJid, {
                         image: imageBuffer,
                         caption: caption
