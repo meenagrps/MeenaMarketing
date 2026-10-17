@@ -533,6 +533,13 @@ module.exports = (client, db) => {
         if (isProcessing) return;
         isProcessing = true;
         
+        // ADVANCED FIX: Ensure socket is active and authenticated before running background marketing loops
+        if (!activeClient || !activeClient.user) {
+            console.log("⚠️ WhatsApp client not authenticated. Pausing marketing engine.");
+            isProcessing = false;
+            return;
+        }
+
         try {
             let snap = await docRef.get();
             let dbData = snap.exists ? snap.data() : null;
