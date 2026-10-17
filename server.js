@@ -93,6 +93,7 @@ let isGeneratingNewCode = false; // Tracks if a manual code refresh was just tri
 let globalQRString = null;
 let globalSocket = null;
 let isSocketConnected = false;
+global.isWhatsAppConnected = false; // Global state flag so background modules know when socket is live
 
 // --- SESSION BACKUP & EDGE-CASE STATE MANAGEMENT ---
 const SESSION_DIR = path.join(__dirname, 'whatsapp-session-baileys');
@@ -255,6 +256,7 @@ app.post('/api/refresh-code', async (req, res) => {
 
         globalQRString = null;
         isSocketConnected = false;
+        global.isWhatsAppConnected = false;
         
         setTimeout(startWhatsAppClient, 2000);
         res.json({ success: true });
@@ -662,19 +664,26 @@ async function startWhatsAppClient() {
 
         if (connection === 'close') {
             isSocketConnected = false;
+            global.isWhatsAppConnected = false; // Immediately notify background modules that socket is offline
             isRestoringSession = false;
             lastConnectedTimestamp = 0;
 
             const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const shortError = lastDisconnect?.error?.message || 'Unknown network drop';
+            const isStreamError = shortError.toLowerCase().includes('stream errored') || shortError.toLowerCase().includes('restart required') || statusCode === 500 || statusCode === 515;
+
+            // ADVANCED FIX: Do NOT treat status 500 (DisconnectReason.badSession / Stream Errored (ack)) as a fatal session wipe!
+            // Only wipe the session on explicit user logout (401), forbidden (403), or multidevice mismatch (411).
             const isFatalSessionError =
-                statusCode === DisconnectReason.loggedOut ||
-                statusCode === DisconnectReason.badSession ||
-                statusCode === DisconnectReason.multideviceMismatch ||
-                statusCode === 401 ||
-                statusCode === 403; 
+                !isStreamError && (
+                    statusCode === DisconnectReason.loggedOut ||
+                    (statusCode === DisconnectReason.badSession && statusCode !== 500) ||
+                    statusCode === DisconnectReason.multideviceMismatch ||
+                    statusCode === 401 ||
+                    statusCode === 403
+                ); 
 
             const shouldReconnect = !isFatalSessionError;
-            const shortError = lastDisconnect?.error?.message || 'Unknown network drop';
             
             // ADVANCED FIX: Cleanly destroy the ghost socket to stop memory leaks and overlapping file writes
             try {
@@ -709,6 +718,7 @@ async function startWhatsAppClient() {
         } else if (connection === 'open') {
             console.log('✅ Baileys WhatsApp is ready!');
             isSocketConnected = true;
+            global.isWhatsAppConnected = true; // Notify background modules that socket is authenticated and open
             isRestoringSession = false;
             isSessionExpired = false;
             sessionExpiredMessage = "";
@@ -1306,29 +1316,30 @@ async function generateReceiptImage(data) {
 let modulesLoaded = false; 
 
 function loadDynamicModules() {
-    if (modulesLoaded) {
-        console.log('📦 Modules already loaded. Skipping re-initialization on reconnect.');
-        return;
-    }
-    modulesLoaded = true;
-
+    // ADVANCED FIX: Always pass the fresh globalSocket to modules on reconnect so activeClient is updated!
     if (fs.existsSync('./marketing.js')) {
-        console.log('📦 Loading marketing.js module...');
+        if (!modulesLoaded) console.log('📦 Loading marketing.js module...');
         require('./marketing.js')(globalSocket, db);
     } else if (fs.existsSync('./mrkting.js')) {
-        console.log('📦 Loading mrkting.js module...');
+        if (!modulesLoaded) console.log('📦 Loading mrkting.js module...');
         require('./mrkting.js')(globalSocket, db);
     }
 
     if (fs.existsSync('./other.js')) {
-        console.log('📦 Loading other.js module...');
+        if (!modulesLoaded) console.log('📦 Loading other.js module...');
         require('./other.js')(globalSocket, db);
     }
 
     if (fs.existsSync('./gstReporter.js')) {
-        console.log('📦 Loading gstReporter.js module...');
+        if (!modulesLoaded) console.log('📦 Loading gstReporter.js module...');
         require('./gstReporter.js')(globalSocket, db);
     }
+
+    if (modulesLoaded) {
+        console.log('📦 Modules already loaded. Skipping re-initialization on reconnect (Socket references refreshed).');
+        return;
+    }
+    modulesLoaded = true;
 }
 
 // Start the engine
