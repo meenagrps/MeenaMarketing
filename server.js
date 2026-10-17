@@ -1,4 +1,4 @@
-const { makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers, makeCacheableSignalKeyStore, isJidBroadcast } = require('@whiskeysockets/baileys');
 const admin = require('firebase-admin');
 const express = require('express');
 const fs = require('fs');
@@ -38,6 +38,45 @@ process.on('unhandledRejection', (reason, promise) => {
 process.on('uncaughtException', (error) => {
     // Suppress spammy background exceptions from Baileys
 });
+
+// ADVANCED FIX: Silence hardcoded console.error / console.warn / console.log spam from internal libsignal decryption retries
+const LIBSIGNAL_SPAM_PATTERNS = [
+    'Bad MAC',
+    'Failed to decrypt message with any known session',
+    'Session error:',
+    'verifyMAC',
+    'doDecryptWhisperMessage',
+    'decryptWithSessions',
+    '_asyncQueueExecutor',
+    'Closing open session in favor of incoming prekey bundle'
+];
+
+function isLibsignalSpam(args) {
+    try {
+        const msg = args.map(a => (typeof a === 'string' ? a : (a?.stack || a?.message || ''))).join(' ');
+        return LIBSIGNAL_SPAM_PATTERNS.some(pattern => msg.includes(pattern));
+    } catch (e) {
+        return false;
+    }
+}
+
+const origConsoleError = console.error;
+console.error = function (...args) {
+    if (isLibsignalSpam(args)) return;
+    origConsoleError.apply(console, args);
+};
+
+const origConsoleWarn = console.warn;
+console.warn = function (...args) {
+    if (isLibsignalSpam(args)) return;
+    origConsoleWarn.apply(console, args);
+};
+
+const origConsoleLog = console.log;
+console.log = function (...args) {
+    if (isLibsignalSpam(args)) return;
+    origConsoleLog.apply(console, args);
+};
 
 // Advanced: Graceful termination to prevent session corruption on Hugging Face restarts
 const shutdownHandler = async (signal) => {
@@ -104,6 +143,17 @@ let sessionExpiredMessage = "";
 let isRestoringSession = false;
 let lastConnectedTimestamp = 0; // Ensures keys are flushed before allowing download
 let waitingForAdminUpdate = {}; // State tracker for interactive admin number updates
+
+// --- LIGHTWEIGHT IN-MEMORY MESSAGE CACHE FOR MULTI-DEVICE RETRY HANDSHAKES ---
+const recentSentMessagesCache = new Map();
+function cacheMessageForRetry(key, messageContent) {
+    if (!key || !key.id || !messageContent) return;
+    recentSentMessagesCache.set(key.id, messageContent);
+    if (recentSentMessagesCache.size > 500) {
+        const oldestKey = recentSentMessagesCache.keys().next().value;
+        recentSentMessagesCache.delete(oldestKey);
+    }
+}
 
 // --- ADVANCED CONNECTION LOCK, STRIKE COUNTER & SOCKET WAIT HELPERS ---
 let isStartingClient = false;
@@ -702,9 +752,29 @@ async function startWhatsAppClient() {
             connectTimeoutMs: 60000,
             defaultQueryTimeoutMs: 60000,
             retryRequestDelayMs: 2000,
+            maxMsgRetryCount: 5,
             markOnlineOnConnect: false,
-            syncFullHistory: false
+            syncFullHistory: false,
+            // ADVANCED FIX 1: Ignore status broadcasts & newsletters that trigger Bad MAC loops across multiple linked bots
+            shouldIgnoreJid: (jid) => isJidBroadcast(jid) || (typeof jid === 'string' && (jid.includes('broadcast') || jid.endsWith('@newsletter'))),
+            // ADVANCED FIX 2: Fulfill retry handshakes when companion devices/bots desync on Signal ratchets
+            getMessage: async (key) => {
+                if (key?.id && recentSentMessagesCache.has(key.id)) {
+                    return recentSentMessagesCache.get(key.id);
+                }
+                return { conversation: '' };
+            }
         });
+
+        // Wrap sendMessage to automatically cache outgoing messages for multi-device retry requests
+        const origSendMessage = sock.sendMessage.bind(sock);
+        sock.sendMessage = async (jid, content, options) => {
+            const sentMsg = await origSendMessage(jid, content, options);
+            if (sentMsg?.key && sentMsg?.message) {
+                cacheMessageForRetry(sentMsg.key, sentMsg.message);
+            }
+            return sentMsg;
+        };
 
         globalSocket = sock;
         isStartingClient = false;
@@ -826,6 +896,11 @@ async function startWhatsAppClient() {
             if (type !== 'notify') return;
             const msg = messages[0];
             
+            // Cache any valid incoming/synced messages for retry handshakes
+            if (msg?.key && msg?.message) {
+                cacheMessageForRetry(msg.key, msg.message);
+            }
+
             // Ignore status broadcasts and bot's own messages
             if (!msg.message || msg.key.remoteJid === 'status@broadcast' || msg.key.fromMe) return;
 
