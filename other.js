@@ -28,11 +28,31 @@ const puppeteer = require('puppeteer');
 
 let isOtherModuleInitialized = false;
 let activeClient = null; // Holds the latest Baileys socket reference across reconnects
+let cachedGroupParticipants = {}; // Caches group participant JIDs to prevent "Waiting for this message" Signal key errors
+let cachedMorningDate = null; // Moved to module scope so reconnects never wipe RAM state
+let cachedEveningDate = null; // Moved to module scope so reconnects never wipe RAM state
+let isFirebaseStateLoaded = false; // Prevents race conditions where Watchdog fires before Firebase finishes loading
 
 // 🛡️ Added 'db' to the export signature to accept Firebase instance
 module.exports = (client, db) => {
     console.log("📦 Starting other.js");
     activeClient = client;
+
+    // ---------------------------------------------------------
+    // SOCKET READINESS & SIGNAL ENCRYPTION HELPERS (NEW)
+    // ---------------------------------------------------------
+    const sleep = (ms) => new Promise(res => setTimeout(res, ms));
+
+    /**
+     * Checks if the active Baileys socket is genuinely connected, authenticated, and open.
+     */
+    function isSocketReady(sockInstance) {
+        const s = sockInstance || activeClient;
+        if (!s || !s.user) return false;
+        if (typeof global.isWhatsAppConnected === 'boolean' && !global.isWhatsAppConnected) return false;
+        if (s.ws && typeof s.ws.readyState === 'number' && s.ws.readyState !== 1) return false;
+        return true;
+    }
 
     // ---------------------------------------------------------
     // CRASH PROTECTION NET (Prevents silent exits)
@@ -85,17 +105,19 @@ module.exports = (client, db) => {
     // ---------------------------------------------------------
     // 0. PRE-FLIGHT DISK CLEANUP (Prevents storage leaks)
     // ---------------------------------------------------------
-    try {
-        console.log("🧹 Running startup disk cleanup for old images...");
-        const files = fs.readdirSync(__dirname);
-        for (const file of files) {
-            if (file.startsWith('meena_marketing_') && file.endsWith('.png')) {
-                fs.unlinkSync(path.join(__dirname, file));
-                console.log(`🗑️ Cleared orphaned image: ${file}`);
+    if (!isOtherModuleInitialized && !global.isOtherModuleInitialized) {
+        try {
+            console.log("🧹 Running startup disk cleanup for old images...");
+            const files = fs.readdirSync(__dirname);
+            for (const file of files) {
+                if (file.startsWith('meena_marketing_') && file.endsWith('.png')) {
+                    fs.unlinkSync(path.join(__dirname, file));
+                    console.log(`🗑️ Cleared orphaned image: ${file}`);
+                }
             }
+        } catch (err) {
+            console.error("⚠️ Cleanup error:", err.message);
         }
-    } catch (err) {
-        console.error("⚠️ Cleanup error:", err.message);
     }
 
     // ---------------------------------------------------------
@@ -140,24 +162,25 @@ module.exports = (client, db) => {
     loadGroupMemory();
 
     // 🛡️ Firebase State Tracking (RAM Cached to prevent database reads)
-    let cachedMorningDate = null;
-    let cachedEveningDate = null;
-
     async function loadFirebaseState() {
         try {
             const docSnap = await db.collection('group_message').doc('status').get();
             if (docSnap.exists) {
                 const data = docSnap.data();
-                cachedMorningDate = data.lastMorningBlastDate || null;
-                cachedEveningDate = data.lastEveningBlastDate || null;
+                cachedMorningDate = data.lastMorningBlastDate || cachedMorningDate || null;
+                cachedEveningDate = data.lastEveningBlastDate || cachedEveningDate || null;
                 console.log(`🔥 [Firebase State Loaded] Morning: ${cachedMorningDate} | Evening: ${cachedEveningDate}`);
             }
+            isFirebaseStateLoaded = true;
         } catch (err) {
             console.error("⚠️ Failed to load Firebase state on boot:", err.message);
+            isFirebaseStateLoaded = true; // Allow operation even if initial read had a network blip
         }
     }
 
-    loadFirebaseState(); // Fires exactly once on startup
+    if (!isFirebaseStateLoaded) {
+        loadFirebaseState(); // Fires exactly once on initial startup
+    }
 
     // ---------------------------------------------------------
     // 2. IMAGE GENERATION ENGINE (HTML to PNG via Puppeteer - 512MB RAM SAFE)
@@ -332,10 +355,14 @@ module.exports = (client, db) => {
                 </html>
             `;
 
-            await page.setContent(htmlContent, { waitUntil: 'networkidle0', timeout: 60000 });
+            // Use domcontentloaded + short font timeout so slow Google Font CDNs never hang Puppeteer
+            await page.setContent(htmlContent, { waitUntil: 'domcontentloaded', timeout: 60000 });
             
-            // Wait for Web Fonts to fully load before snapping the picture
-            await page.evaluateHandle('document.fonts.ready');
+            // Wait for Web Fonts to fully load (capped at 5s so it never hangs)
+            await Promise.race([
+                page.evaluateHandle('document.fonts.ready'),
+                sleep(5000)
+            ]);
             
             await page.screenshot({ path: tempPath, type: 'png' });
             
@@ -484,28 +511,113 @@ module.exports = (client, db) => {
     }
 
     // ---------------------------------------------------------
-    // 7. MESSAGE DISPATCHERS (BAILEYS EDITION)
+    // 7. MESSAGE DISPATCHERS & "WAITING FOR THIS MESSAGE" FIX (BAILEYS EDITION)
     // ---------------------------------------------------------
-    async function sendGroupMessageWithMedia(groupJid, textContent, imagePath) {
-        const sock = activeClient;
-        if (!sock) throw new Error("WhatsApp socket is not initialized.");
+    /**
+     * 🛡️ CRITICAL BAILEYS FIX FOR "Waiting for this message. Check your phone":
+     * In Baileys Multi-Device, sending a message to a group or user without pre-fetching
+     * group metadata & asserting Signal pre-keys causes recipients' phones to fail decryption
+     * and show "Waiting for this message".
+     */
+    async function warmUpEncryptionSession(sock, targetJid) {
+        if (!sock || !targetJid) return [];
+        let jidsToWarm = [];
 
-        if (imagePath && fs.existsSync(imagePath)) {
-            const imageBuffer = fs.readFileSync(imagePath);
-            await sock.sendMessage(groupJid, {
-                image: imageBuffer,
-                caption: textContent
-            });
-        } else {
-            await sock.sendMessage(groupJid, {
-                text: textContent
-            });
+        try {
+            if (targetJid.endsWith('@g.us')) {
+                // 1. Always fetch fresh group metadata so Baileys knows every participant's JID/LID
+                const metadata = await sock.groupMetadata(targetJid);
+                if (metadata && Array.isArray(metadata.participants)) {
+                    jidsToWarm = metadata.participants
+                        .map(p => p.id || p.jid)
+                        .filter(Boolean);
+                    cachedGroupParticipants[targetJid] = jidsToWarm;
+                }
+            } else {
+                jidsToWarm = [targetJid];
+            }
+        } catch (metaErr) {
+            console.warn(`⚠️ [other.js] Could not fetch live groupMetadata for ${targetJid}, using cached participants if available.`);
+            jidsToWarm = cachedGroupParticipants[targetJid] || [];
         }
+
+        // 2. Pre-assert Signal sessions for participants & subscribe presence to flush SenderKeys
+        try {
+            if (typeof sock.assertSessions === 'function' && jidsToWarm.length > 0) {
+                await sock.assertSessions(jidsToWarm, false).catch(() => {});
+            }
+            await sock.presenceSubscribe(targetJid).catch(() => {});
+            await sock.sendPresenceUpdate('composing', targetJid).catch(() => {});
+            await sleep(1500);
+            await sock.sendPresenceUpdate('paused', targetJid).catch(() => {});
+        } catch (sessionErr) {
+            // Ignore non-fatal warm-up errors
+        }
+
+        return jidsToWarm;
+    }
+
+    async function sendGroupMessageWithMedia(groupJid, textContent, imagePath) {
+        let sock = activeClient;
+        if (!isSocketReady(sock)) throw new Error("WhatsApp socket is not connected or authenticated.");
+
+        const hasImage = Boolean(imagePath && fs.existsSync(imagePath));
+        const imageBuffer = hasImage ? fs.readFileSync(imagePath) : null;
+
+        let retries = 3;
+        let lastError = null;
+
+        while (retries > 0) {
+            try {
+                // Always grab the freshest socket reference in case a reconnect happened during Puppeteer rendering
+                sock = activeClient;
+                if (!isSocketReady(sock)) {
+                    throw new Error("Connection Closed");
+                }
+
+                // Warm up group metadata & Signal SenderKeys to prevent "Waiting for this message"
+                const participantJids = await warmUpEncryptionSession(sock, groupJid);
+                const sendOptions = (groupJid.endsWith('@g.us') && participantJids.length > 0)
+                    ? { statusJidList: participantJids }
+                    : {};
+
+                if (hasImage && imageBuffer) {
+                    await sock.sendMessage(groupJid, {
+                        image: imageBuffer,
+                        caption: textContent
+                    }, sendOptions);
+                } else {
+                    await sock.sendMessage(groupJid, {
+                        text: textContent
+                    }, sendOptions);
+                }
+                return; // Sent successfully!
+            } catch (err) {
+                lastError = err;
+                retries--;
+                const errMsg = err?.message || String(err);
+                console.warn(`⚠️ [other.js] Group send attempt failed (${retries} retries left): ${errMsg}`);
+
+                // If group ID in .meena_group_ram.json became stale/invalid, clear it and re-scan on retry
+                if (errMsg.includes('not-authorized') || errMsg.includes('item-not-found') || errMsg.includes('forbidden')) {
+                    console.warn(`⚠️ [other.js] Cached group ID (${groupJid}) may be invalid. Re-scanning participating groups...`);
+                    memoryGroupId = null;
+                    await ensureGroupConnection();
+                    if (memoryGroupId) groupJid = memoryGroupId;
+                }
+
+                if (retries > 0) {
+                    await sleep(6000);
+                }
+            }
+        }
+
+        throw lastError || new Error("Failed to send group message after retries.");
     }
 
     async function ensureGroupConnection() {
         const sock = activeClient;
-        if (!sock || !sock.user) return false; // ADVANCED FIX: Check sock.user to prevent crash if logged out
+        if (!isSocketReady(sock)) return false; // ADVANCED FIX: Ensure socket is genuinely open & authenticated
 
         // 1. Check local RAM/disk cache first
         if (memoryGroupId) {
@@ -549,6 +661,10 @@ module.exports = (client, db) => {
 
             if (groupIds.length > 0) {
                 const foundId = groupIds[0];
+                // Cache participants immediately while we have the group object
+                if (groupsObj[foundId]?.participants) {
+                    cachedGroupParticipants[foundId] = groupsObj[foundId].participants.map(p => p.id || p.jid).filter(Boolean);
+                }
                 console.log(`✅ Found group via Baileys group scan: ${foundId} (${groupsObj[foundId]?.subject || 'Group'})`);
                 saveGroupMemory(foundId);
                 return true;
@@ -565,8 +681,8 @@ module.exports = (client, db) => {
     // FIXED: Added force parameter to bypass memory locks for manual tests
     async function sendMorningBlast(force = false) {
         // 🚀 ADVANCED FIX: Fast-fail if socket is disconnected before wasting CPU/RAM on Puppeteer
-        if (!activeClient || !activeClient.user) {
-            console.log("⚠️ [other.js] WhatsApp client not authenticated. Pausing Morning Blast.");
+        if (!isSocketReady(activeClient)) {
+            console.log("⚠️ [other.js] WhatsApp client not authenticated or disconnected. Pausing Morning Blast.");
             return;
         }
         
@@ -641,8 +757,8 @@ module.exports = (client, db) => {
     // FIXED: Added force parameter to bypass memory locks for manual tests
     async function sendEveningBlast(force = false) {
         // 🚀 ADVANCED FIX: Fast-fail if socket is disconnected before wasting CPU/RAM on Puppeteer
-        if (!activeClient || !activeClient.user) {
-            console.log("⚠️ [other.js] WhatsApp client not authenticated. Pausing Evening Blast.");
+        if (!isSocketReady(activeClient)) {
+            console.log("⚠️ [other.js] WhatsApp client not authenticated or disconnected. Pausing Evening Blast.");
             return;
         }
         
@@ -714,8 +830,8 @@ module.exports = (client, db) => {
 
     async function sendForcedFestivalBlast(festivalName) {
         // 🚀 ADVANCED FIX: Fast-fail if socket is disconnected before wasting CPU/RAM on Puppeteer
-        if (!activeClient || !activeClient.user) {
-            console.log("⚠️ [other.js] WhatsApp client not authenticated. Pausing Forced Blast.");
+        if (!isSocketReady(activeClient)) {
+            console.log("⚠️ [other.js] WhatsApp client not authenticated or disconnected. Pausing Forced Blast.");
             return;
         }
         
@@ -790,10 +906,11 @@ module.exports = (client, db) => {
             const args = bodyText.trim().split(/\s+/);
             const command = args[1] ? args[1].toLowerCase() : '';
 
-            // Helper functions for Baileys reactions and quoted replies
+            // Helper functions for Baileys reactions and quoted replies (Always use latest activeClient)
             const reactToMsg = async (emoji) => {
                 try {
-                    await sockInstance.sendMessage(chatJid, {
+                    const liveSock = activeClient || sockInstance;
+                    await liveSock.sendMessage(chatJid, {
                         react: { text: emoji, key: msg.key }
                     });
                 } catch (e) {}
@@ -801,11 +918,20 @@ module.exports = (client, db) => {
 
             const replyToMsg = async (text) => {
                 try {
-                    await sockInstance.sendMessage(chatJid, { text }, { quoted: msg });
+                    const liveSock = activeClient || sockInstance;
+                    await warmUpEncryptionSession(liveSock, chatJid);
+                    await liveSock.sendMessage(chatJid, { text }, { quoted: msg });
                 } catch (e) {}
             };
 
             try {
+                // Prevent overlapping manual test commands from spawning multiple simultaneous Puppeteer instances
+                if (global.isRunningOtherTestCommand) {
+                    await replyToMsg('⏳ A test blast is already rendering and sending. Please wait a few seconds...');
+                    return;
+                }
+                global.isRunningOtherTestCommand = true;
+
                 // Acknowledge receipt immediately with an hourglass reaction
                 await reactToMsg('⏳'); 
 
@@ -839,6 +965,8 @@ module.exports = (client, db) => {
             } catch (err) {
                 console.error(`⚠️ Test command failed: ${err.message}`);
                 await reactToMsg('❌');
+            } finally {
+                global.isRunningOtherTestCommand = false;
             }
         });
     };
@@ -857,7 +985,8 @@ module.exports = (client, db) => {
     // 9. EXACT CRON SCHEDULERS
     // ---------------------------------------------------------
     // 🛡️ Strict execution with explicit timezone overrides
-    cron.schedule('0 7 * * *', () => {
+    if (global.otherMorningCron) global.otherMorningCron.stop();
+    global.otherMorningCron = cron.schedule('0 7 * * *', () => {
         console.log(`⏰ [Scheduler] Running Morning Blast at 7:00 AM IST...`);
         sendMorningBlast();
     }, {
@@ -865,7 +994,8 @@ module.exports = (client, db) => {
         timezone: "Asia/Kolkata"
     });
 
-    cron.schedule('0 17 * * *', () => {
+    if (global.otherEveningCron) global.otherEveningCron.stop();
+    global.otherEveningCron = cron.schedule('0 17 * * *', () => {
         console.log(`⏰ [Scheduler] Running Evening Blast at 5:00 PM IST...`);
         sendEveningBlast();
     }, {
@@ -876,13 +1006,16 @@ module.exports = (client, db) => {
     // ---------------------------------------------------------
     // 10. BULLETPROOF WATCHDOG (Catches missed schedules safely)
     // ---------------------------------------------------------
-    setInterval(async () => {
+    const runWatchdogCheck = async () => {
+        // Wait until Firebase state has been loaded and WhatsApp socket is genuinely connected
+        if (!isFirebaseStateLoaded || !isSocketReady(activeClient)) return;
+
         // 1. Get strict IST Date String securely
         const todayString = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
         
         // 2. Get current hour in IST (returns a number from 0 to 23)
         const hourString = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata', hour: 'numeric', hour12: false });
-        const currentHour = parseInt(hourString, 10);
+        const currentHour = parseInt(hourString, 10) % 24;
 
         // Morning Catch-up: Past 7 AM, but strictly BEFORE 12 PM (Noon).
         // If the PC wakes up past noon, the morning blast is permanently skipped for today.
@@ -896,5 +1029,12 @@ module.exports = (client, db) => {
             console.log("🛡️ Watchdog caught a missed Evening Blast. Executing recovery...");
             await sendEveningBlast();
         }
-    }, 10 * 60 * 1000); // Checks every 10 minutes
+    };
+
+    // Run an initial check 15 seconds after boot (in case server booted inside the catch-up window)
+    if (global.otherWatchdogBootTimeout) clearTimeout(global.otherWatchdogBootTimeout);
+    global.otherWatchdogBootTimeout = setTimeout(runWatchdogCheck, 15000);
+
+    if (global.otherWatchdogInterval) clearInterval(global.otherWatchdogInterval);
+    global.otherWatchdogInterval = setInterval(runWatchdogCheck, 10 * 60 * 1000); // Checks every 10 minutes
 };
