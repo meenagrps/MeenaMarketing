@@ -505,7 +505,7 @@ module.exports = (client, db) => {
 
     async function ensureGroupConnection() {
         const sock = activeClient;
-        if (!sock) return false;
+        if (!sock || !sock.user) return false; // ADVANCED FIX: Check sock.user to prevent crash if logged out
 
         // 1. Check local RAM/disk cache first
         if (memoryGroupId) {
@@ -564,6 +564,12 @@ module.exports = (client, db) => {
 
     // FIXED: Added force parameter to bypass memory locks for manual tests
     async function sendMorningBlast(force = false) {
+        // 🚀 ADVANCED FIX: Fast-fail if socket is disconnected before wasting CPU/RAM on Puppeteer
+        if (!activeClient || !activeClient.user) {
+            console.log("⚠️ [other.js] WhatsApp client not authenticated. Pausing Morning Blast.");
+            return;
+        }
+        
         const todayString = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); // Output: YYYY-MM-DD
         
         // 🛡️ Guard: Prevent duplicate sends on the same day (Bypass if forced)
@@ -634,6 +640,12 @@ module.exports = (client, db) => {
 
     // FIXED: Added force parameter to bypass memory locks for manual tests
     async function sendEveningBlast(force = false) {
+        // 🚀 ADVANCED FIX: Fast-fail if socket is disconnected before wasting CPU/RAM on Puppeteer
+        if (!activeClient || !activeClient.user) {
+            console.log("⚠️ [other.js] WhatsApp client not authenticated. Pausing Evening Blast.");
+            return;
+        }
+        
         const todayString = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); // Output: YYYY-MM-DD
         
         // 🛡️ Guard: Prevent duplicate sends on the same day (Bypass if forced)
@@ -701,6 +713,12 @@ module.exports = (client, db) => {
     }
 
     async function sendForcedFestivalBlast(festivalName) {
+        // 🚀 ADVANCED FIX: Fast-fail if socket is disconnected before wasting CPU/RAM on Puppeteer
+        if (!activeClient || !activeClient.user) {
+            console.log("⚠️ [other.js] WhatsApp client not authenticated. Pausing Forced Blast.");
+            return;
+        }
+        
         console.log(`🛠️ Executing Forced Festival Blast for: ${festivalName}...`);
         if (!(await ensureGroupConnection())) return;
 
