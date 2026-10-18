@@ -1537,29 +1537,30 @@ async function generateReceiptImage(data) {
 let modulesLoaded = false; 
 
 function loadDynamicModules() {
+    if (modulesLoaded) {
+        console.log('📦 Modules already loaded. Skipping re-initialization to prevent duplicate cron jobs.');
+        return;
+    }
+
     // ADVANCED FIX: Always pass the fresh globalSocket to modules on reconnect so activeClient is updated!
     if (fs.existsSync('./marketing.js')) {
-        if (!modulesLoaded) console.log('📦 Loading marketing.js module...');
+        console.log('📦 Loading marketing.js module...');
         require('./marketing.js')(globalSocket, db);
     } else if (fs.existsSync('./mrkting.js')) {
-        if (!modulesLoaded) console.log('📦 Loading mrkting.js module...');
+        console.log('📦 Loading mrkting.js module...');
         require('./mrkting.js')(globalSocket, db);
     }
 
     if (fs.existsSync('./other.js')) {
-        if (!modulesLoaded) console.log('📦 Loading other.js module...');
+        console.log('📦 Loading other.js module...');
         require('./other.js')(globalSocket, db);
     }
 
     if (fs.existsSync('./gstReporter.js')) {
-        if (!modulesLoaded) console.log('📦 Loading gstReporter.js module...');
+        console.log('📦 Loading gstReporter.js module...');
         require('./gstReporter.js')(globalSocket, db);
     }
 
-    if (modulesLoaded) {
-        console.log('📦 Modules already loaded. Skipping re-initialization on reconnect (Socket references refreshed).');
-        return;
-    }
     modulesLoaded = true;
 }
 
