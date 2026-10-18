@@ -1142,13 +1142,14 @@ function formatPhone(num) {
 // ---------------------------------------------------------
 // 5. REAL-TIME BILLING TRIGGER (From Firebase)
 // ---------------------------------------------------------
+// ADVANCED FIX: Replaced .forEach() with a synchronous for...of loop to prevent parallel memory crashing on Render 512MB
 db.collection('sellings').where('createdAt', '>=', serverStartTime).onSnapshot(async (snapshot) => {
-    snapshot.docChanges().forEach(async (change) => {
+    for (const change of snapshot.docChanges()) {
         if (change.type === 'added') {
             const billData = change.doc.data();
-            if (billData.createdAt && billData.createdAt.toDate() < serverStartTime) return;
+            if (billData.createdAt && billData.createdAt.toDate() < serverStartTime) continue;
             if (!globalSocket || !isSocketConnected) await waitForSocketReady(15000);
-            if (!globalSocket || !isSocketConnected) return; // Prevent sending if socket is dead
+            if (!globalSocket || !isSocketConnected) continue; // Prevent sending if socket is dead
             
             const invNo = billData.invoiceNo || 'N/A';
             const grandTotal = billData.totals?.grand || 0;
@@ -1208,9 +1209,14 @@ db.collection('sellings').where('createdAt', '>=', serverStartTime).onSnapshot(a
                     try {
                         const targetJid = getJid(adminPhone);
                         await globalSocket.sendMessage(targetJid, { text: messageToSend });
-                    } catch (e) {}
+                    } catch (err) {
+                        console.error(`⚠️ Admin Alert Error [${invNo}]:`, err.message ? err.message.split('\n')[0] : "Failed");
+                    }
                 }
             }
+
+            // Stagger delay between Admin and Customer to prevent WhatsApp rate limits
+            await sleep(1500);
 
             const rawCustPhone = billData.customer?.phone;
             const formattedCustPhone = formatPhone(rawCustPhone);
@@ -1218,12 +1224,34 @@ db.collection('sellings').where('createdAt', '>=', serverStartTime).onSnapshot(a
             if (formattedCustPhone) {
                 try {
                     const targetJid = getJid(formattedCustPhone);
-                    const imageBuffer = await generateReceiptImage(billData);
+
+                    // ADVANCED FIX: Verify if the customer is actually registered on WhatsApp before generating anything
+                    const [waStatus] = await globalSocket.onWhatsApp(targetJid);
+                    if (!waStatus || !waStatus.exists) {
+                        console.log(`ℹ️ Bill ${invNo}: Number ${formattedCustPhone} is NOT registered on WhatsApp. Skipping receipt.`);
+                        continue; // Move to the next bill in the loop
+                    }
+
+                    // Simulate human typing presence to bypass bot spam filters
+                    await globalSocket.sendPresenceUpdate('composing', targetJid);
+                    await sleep(2000);
                     
+                    const imageBuffer = await generateReceiptImage(billData);
                     const receiptCaption = `🎉 *Thank you for shopping at Meena Marketing!*\n📄 Bill No: *${invNo}*\n💰 Total Amount: *₹${grandTotal.toLocaleString()}*\n📅 Date: ${dateStr}\n\n🎉 *மீனா மார்க்கெட்டிங்கில் பொருட்கள் வாங்கியமைக்கு நன்றி!*\n📄 பில் எண்: *${invNo}*\n💰 மொத்த தொகை: *₹${grandTotal.toLocaleString()}*\n📅 தேதி: ${dateStr}\n\n_System Generated Receipt_\n⚡ *Powered by Goorac*`;
                     
-                    await globalSocket.sendMessage(targetJid, { image: imageBuffer, caption: receiptCaption });
-                    console.log(`✅ Sent receipt to customer for ${invNo}`);
+                    // ADVANCED FIX: Smart Fallback Logic for strict spam filters
+                    try {
+                        // Attempt 1: Direct Image Send
+                        await globalSocket.sendMessage(targetJid, { image: imageBuffer, caption: receiptCaption });
+                        console.log(`✅ Sent receipt to customer for ${invNo}`);
+                    } catch (primarySendErr) {
+                        // Attempt 2: If image is blocked, send warm-up text, wait, then push image
+                        console.log(`⚠️ Direct image send failed for ${invNo}. Attempting chat warm-up...`);
+                        await globalSocket.sendMessage(targetJid, { text: "Hi. This is your receipt from Meena Marketing." });
+                        await sleep(2500); // Give the WhatsApp network time to register an active text chat
+                        await globalSocket.sendMessage(targetJid, { image: imageBuffer, caption: receiptCaption });
+                        console.log(`✅ Sent receipt to customer via fallback for ${invNo}`);
+                    }
                     
                     const thankYouUrl = `https://huggingface.co/datasets/corporationgoorac/marketingVoice/resolve/main/image.png?t=${Date.now()}`;
                     const thankYouCaption = `🎉 *Thank you for choosing Meena Marketing!*\n🎉 *மீனா மார்க்கெட்டிங்கைத் தேர்ந்தெடுத்ததற்கு நன்றி!*\n\n⚡ _Powered by Goorac_`;
@@ -1231,12 +1259,14 @@ db.collection('sellings').where('createdAt', '>=', serverStartTime).onSnapshot(a
                     await sleep(2000); 
                     await globalSocket.sendMessage(targetJid, { image: { url: thankYouUrl }, caption: thankYouCaption });
                     
-                } catch (err) {}
+                } catch (err) {
+                    console.error(`⚠️ Receipt Error [${invNo}]:`, err.message ? err.message.split('\n')[0] : "Failed");
+                }
             } else {
                 console.log(`ℹ️ Bill ${invNo} saved with no valid customer phone. Admin alerted.`);
             }
         }
-    });
+    }
 });
 
 // ---------------------------------------------------------
@@ -1283,7 +1313,9 @@ _Meena Marketing Internal_`;
         const adminJid = getJid(currentAdminPhone1);
         await globalSocket.sendMessage(adminJid, { text: inquiryMessage });
         console.log(`✅ Inquiry details for "${prodName}" dispatched successfully to Admin 1.`);
-    } catch (err) {}
+    } catch (err) {
+        console.error("⚠️ Admin Inquiry Error:", err.message ? err.message.split('\n')[0] : "Failed");
+    }
 
     if (currentShopPhone) {
         let shopInquiryMessage = "";
@@ -1323,7 +1355,9 @@ _Request has been successfully dispatched to Admin for final review if further n
         try {
             const shopJid = getJid(currentShopPhone);
             await globalSocket.sendMessage(shopJid, { text: shopInquiryMessage });
-        } catch (err) {}
+        } catch (err) {
+            console.error("⚠️ Shop Inquiry Error:", err.message ? err.message.split('\n')[0] : "Failed");
+        }
     }
 });
 
@@ -1384,7 +1418,9 @@ _Meena Marketing Security_`;
         try {
             const adminJid = getJid(adminPhone);
             await globalSocket.sendMessage(adminJid, { text: messageToSend });
-        } catch (err) {}
+        } catch (err) {
+            console.error("⚠️ Stock Alert Error:", err.message ? err.message.split('\n')[0] : "Failed");
+        }
     }
 });
 
@@ -1392,10 +1428,20 @@ _Meena Marketing Security_`;
 // 6. PUPPETEER IMAGE GENERATOR (Adapted for Baileys)
 // ---------------------------------------------------------
 async function generateReceiptImage(data) {
-    // Launch an isolated Puppeteer instance since Baileys doesn't have one
+    // ADVANCED FIX: Aggressive 512MB RAM constraints added to args
     const browser = await puppeteer.launch({
         headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+        args: [
+            '--no-sandbox', 
+            '--disable-setuid-sandbox', 
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--no-zygote',
+            '--single-process',
+            '--disable-software-rasterizer',
+            '--mute-audio',
+            '--disable-extensions'
+        ]
     });
     
     try {
@@ -1477,10 +1523,11 @@ async function generateReceiptImage(data) {
         </html>`;
 
         await page.setContent(htmlContent, { waitUntil: 'networkidle0' });
-        const screenshot = await page.screenshot({ type: 'png', fullPage: true });
+        // ADVANCED FIX: Exported as JPEG with 80 quality to drastically lower WhatsApp network transmission load
+        const screenshot = await page.screenshot({ type: 'jpeg', quality: 80, fullPage: true });
         return screenshot;
     } finally {
-        await browser.close();
+        await browser.close(); // Ensures 100% successful memory cleanup after every receipt
     }
 }
 
